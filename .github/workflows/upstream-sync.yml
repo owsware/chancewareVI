@@ -1,0 +1,41 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '37 8 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+
+jobs:
+  propose:
+    if: github.repository == 'owsware/chancewareVI' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Open a draft when upstream is ahead
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream=Marvisak:main
+          pending=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$upstream" --jq .ahead_by)
+          if (( pending == 0 )); then
+            echo 'No upstream commits pending.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          existing=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f base=main -f head="$upstream" --jq '.[0].html_url // empty')
+          if [[ -z "$existing" ]]; then
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/pulls" \
+              -f title='Sync official VIctory into chancewareVI' -f base=main -f head="$upstream" \
+              -F draft=true -F maintainer_can_modify=false \
+              -f body='Review on a Chanceware integration branch if there are conflicts. Preserve the public asset policy and run CI before merging.' \
+              --jq .html_url)
+          fi
+          printf '%s upstream commits pending: %s\n' "$pending" "$existing" >> "$GITHUB_STEP_SUMMARY"
