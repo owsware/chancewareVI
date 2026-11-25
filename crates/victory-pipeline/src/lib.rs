@@ -2,7 +2,7 @@
 //!
 //! Everything here runs on the user's machine, reads the user's files and
 //! writes into the user's cache. Nothing produced here is ever committed:
-//! derived data is still game data (docs/asset-policy.md).
+//! derived data is still game data (see the asset policy in README.md).
 //!
 //! The unit of work is a [`Converter`]: bytes in, bytes out, deterministic.
 //! Results are stored in a content-addressed [`Cache`] keyed by converter

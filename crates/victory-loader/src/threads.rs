@@ -12,6 +12,23 @@ use std::time::{Duration, Instant};
 
 use crate::{DLL_PROCESS_DETACH, LoadedImage};
 
+pub(crate) fn thread_name(thread: windows_sys::Win32::Foundation::HANDLE) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::System::Threading::GetThreadDescription;
+
+    let mut name = std::ptr::null_mut();
+    // SAFETY: the system allocates the UTF-16 string; we free it with LocalFree.
+    unsafe {
+        if GetThreadDescription(thread, &mut name) < 0 || name.is_null() {
+            return String::new();
+        }
+        let len = (0..).take_while(|&i| *name.add(i) != 0).count();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+        LocalFree(name.cast::<c_void>());
+        text
+    }
+}
+
 const DLL_THREAD_ATTACH: u32 = 2;
 const DLL_THREAD_DETACH: u32 = 3;
 

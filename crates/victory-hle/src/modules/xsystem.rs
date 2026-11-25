@@ -41,7 +41,7 @@ const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 pub static OBJECT: Object = Object::new("system", &VTABLE);
 pub static ANALYTICS_OBJECT: Object = Object::new("analytics", &ANALYTICS_VTABLE);
 
-/// The interface as Grand Theft Auto VI (2026) asks for it; it calls the
+/// The interface as the title (2026) asks for it; it calls the
 /// same three slots (0x18, 0x20, 0x28) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x1861_cf2e,
@@ -270,7 +270,11 @@ mod device_type {
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                "api-ms-win-core-registry-*",
+                "kernelbase.dll",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
@@ -359,6 +363,33 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn registry_apis_resolve_through_kernelbase() {
+            let device_type = module();
+
+            assert!(device_type.serves("kernelbase.dll"));
+
+            for name in [
+                "RegOpenKeyW",
+                "RegOpenKeyExW",
+                "RegQueryValueExW",
+                "RegCloseKey",
+            ] {
+                let expected = device_type
+                    .exports
+                    .iter()
+                    .find(|export| export.name == name)
+                    .unwrap_or_else(|| panic!("{name} is missing"))
+                    .address;
+
+                assert_eq!(
+                    crate::registry::lookup("kernelbase.dll", name),
+                    Some(expected),
+                    "{name} should resolve through kernelbase.dll"
+                );
+            }
         }
     }
 }

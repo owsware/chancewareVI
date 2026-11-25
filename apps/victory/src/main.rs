@@ -1,11 +1,10 @@
-//! `victory`: the command-line front end.
+//! `chanceware`: the command-line front end.
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
 mod census;
 mod inspect;
-mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -17,9 +16,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
+    name = "chanceware",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Chanceware: Xbox Series compatibility layer for Windows"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -58,21 +57,15 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout. Shader packs
-    /// among the paths are listed last, their stages named from the
-    /// containers found.
+    /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found (and per pack pipeline).
+        /// Print one line per container found.
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
-        /// Instead list the effects of shader databases: technique, pass,
-        /// shaders (name, container hash, engine hash) and pass state.
-        #[arg(long)]
-        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -82,10 +75,7 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader. With
-        /// `--cache`: then make every pipeline of the title's shader pack
-        /// into the host pipeline library `run` reads (on this GPU and
-        /// driver; a second time only what is not there yet).
+        /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
@@ -94,11 +84,17 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate into the shader cache `run` reads (the warm-up):
-        /// every container found, once, nothing else checked or listed
-        /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
-        cache: bool,
+    },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -136,11 +132,6 @@ enum Console {
     SeriesS,
 }
 
-/// Diagnostics: the heap bytes Rust code holds, for the statistics.
-#[cfg(all(windows, feature = "diagnostics"))]
-#[global_allocator]
-static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
-
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -165,23 +156,25 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-            effects,
-        } => shader::run(paths, verbose || disasm, disasm, effects),
-        Command::Translate {
-            paths,
-            jobs,
-            pipelines,
-            cache: true,
-            ..
-        } => translate::warm(paths, jobs, pipelines),
+        } => shader::run(paths, verbose || disasm, disasm),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
-            cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
             exe,
             unimplemented,
@@ -190,12 +183,13 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
-            if code != 0 {
-                // Preserve all 32 bits of the Windows process status.
-                std::process::exit(code as i32);
-            }
-            Ok(())
+            let result = run::run(&exe, unimplemented, strict, execute, console);
+            // The process's own end, as `main`'s Result maps it: Ok is 0,
+            // Err is 1. A title that ends the process itself logs its own
+            // line and never returns here.
+            let code = if result.is_ok() { 0 } else { 1 };
+            tracing::info!("runtime exit: code {code}");
+            result
         }
         Command::Config => show_config(),
     }
@@ -217,7 +211,6 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

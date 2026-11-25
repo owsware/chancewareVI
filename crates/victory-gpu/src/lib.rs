@@ -12,38 +12,34 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees, `external` host
-//! libraries recording into title lists. Planned:
+//! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod debug_hud;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
-#[cfg(windows)]
-pub mod external;
 pub mod fence;
 pub mod frame;
-mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
-pub mod list;
 #[cfg(windows)]
-mod memory;
+mod inplace;
+#[cfg(windows)]
+mod material_demand;
+pub mod list;
 pub mod object;
 pub mod pipeline;
-#[cfg(windows)]
-mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -55,24 +51,30 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
-mod switch;
-#[cfg(windows)]
-mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
-mod twin;
-#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod window_identity;
+#[cfg(windows)]
+pub use window_identity::use_title_window;
+#[cfg(windows)]
+mod writeback;
+#[cfg(windows)]
+mod texback;
 
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    title_bytes_written, title_memory_reading, title_memory_reading_range, title_memory_remapped,
+    title_memory_remapping, title_memory_remapping_range,
     writing as kernel_will_write,
 };

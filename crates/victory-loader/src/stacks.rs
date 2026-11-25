@@ -2,12 +2,10 @@
 //! each thread's unwound stack as `module+rva` that many seconds after
 //! [`dump_stacks_on_schedule`], to find what a title waits on.
 
-use std::ffi::c_void;
-
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
 };
@@ -15,7 +13,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
+    GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
@@ -27,28 +25,19 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let times = schedule(&list);
+    let mut times: Vec<f64> = list
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    times.sort_by(f64::total_cmp);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
-        for at in times {
+        for t in times {
+            let at = std::time::Duration::from_secs_f64(t.max(0.0));
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             dump_stacks();
         }
     });
-}
-
-/// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in
-/// order. Negative times are now; times no `Duration` holds (`inf`, `NaN`,
-/// `1e20`) are left out instead of panicking the dump thread.
-fn schedule(list: &str) -> Vec<std::time::Duration> {
-    let mut times: Vec<_> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse::<f64>().ok())
-        .filter(|t| !t.is_nan())
-        .filter_map(|t| std::time::Duration::try_from_secs_f64(t.max(0.0)).ok())
-        .collect();
-    times.sort();
-    times
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -112,7 +101,7 @@ pub fn dump_stacks() {
         let (frames, (priority, base)) = frames_of(thread);
         eprintln!(
             "  thread {id} \"{}\" start {} priority {priority} (base {base})",
-            name_of(thread),
+            crate::threads::thread_name(thread),
             locate(start_of(thread))
         );
         for (i, pc) in frames.into_iter().enumerate() {
@@ -134,12 +123,6 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         priority: 0,
         base_priority: 0,
     };
-    // Suspended first: a running thread may exit and free its TEB between
-    // the query and the read below.
-    // SAFETY: a thread of this process that is not this one.
-    if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
-    }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
         NtQueryInformationThread(
@@ -151,20 +134,21 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         )
     };
     if status != 0 || info.teb.is_null() {
-        // SAFETY: suspended above.
-        unsafe { ResumeThread(thread) };
         return (frames, (0, 0));
     }
-    // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
-    // holds the stack base at +8 and the stack limit at +0x10.
+    // SAFETY: the TEB of a live thread of this process: its NT_TIB holds
+    // the stack base at +8 and the stack limit at +0x10.
     let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
-    // SAFETY: reads and resumes the thread suspended above; nothing until
-    // the resume allocates or takes a lock the thread could hold besides
-    // the unwinder's own.
+    // SAFETY: suspends, reads and resumes a thread that is not this one;
+    // nothing between suspend and resume allocates or takes a lock the
+    // thread could hold besides the unwinder's own.
     unsafe {
+        if SuspendThread(thread) == u32::MAX {
+            return (frames, (info.priority, info.base_priority));
+        }
         if GetThreadContext(thread, &mut context.0) != 0 {
             unwind_into(context.0, low, high, &mut frames);
         }
@@ -186,20 +170,6 @@ fn start_of(thread: HANDLE) -> usize {
         )
     };
     start
-}
-
-fn name_of(thread: HANDLE) -> String {
-    let mut name = std::ptr::null_mut();
-    // SAFETY: the system allocates the string; we free it with LocalFree.
-    unsafe {
-        if GetThreadDescription(thread, &mut name) < 0 || name.is_null() {
-            return String::new();
-        }
-        let len = (0..).take_while(|&i| *name.add(i) != 0).count();
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
-        LocalFree(name.cast::<c_void>());
-        text
-    }
 }
 
 #[cfg(test)]
@@ -234,19 +204,5 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
-    }
-
-    /// Times no `Duration` holds are left out instead of panicking the dump
-    /// thread (`from_secs_f64` panicked on `inf`); the rest come in order.
-    #[test]
-    fn schedules_skip_times_out_of_range() {
-        let secs = |list| {
-            schedule(list)
-                .iter()
-                .map(|d| d.as_secs_f64())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(secs("30, 5,x,-2,inf,NaN,1e20"), [0.0, 5.0, 30.0]);
-        assert!(schedule("").is_empty());
     }
 }

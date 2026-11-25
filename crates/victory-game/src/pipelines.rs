@@ -7,13 +7,9 @@
 //! The pack names each record's depth-stencil, rasteriser and blend state
 //! only by CityHash64 of the engine's compact description (depth-stencil 24
 //! bytes, rasteriser 16, blend 68). [`Named`] finds the descriptions behind
-//! those hashes from the user's files: the shader databases' state blocks,
-//! the states the pack's register images encode, and for rasterisers and
-//! depth-stencil an enumeration of each field's usual values. A description
-//! counts only if its hash is the record's. (Of 25,471 records these name
-//! all three states of 21,036; one-byte changes of the named descriptions
-//! and a blend enumeration named states of 17 and 32 more records, none
-//! drawn with in the runs measured, and were left out.)
+//! those hashes from the shader databases' state blocks, the pack's register
+//! images, and an enumeration of fields the register images omit. A
+//! description counts only if its hash is the record's.
 //!
 //! Compact layouts (D3D12 enum values throughout):
 //!
@@ -85,11 +81,13 @@ impl Named {
         }
         named.finding = "registers";
         named.name_from_registers(&mut want, pack);
-        // Rasterisers have no register image here; depth states some
-        // registers do not keep.
         named.finding = "enumeration";
-        depth_space(|b| named.try_depth(&mut want, &b));
-        raster_space(|b| named.try_raster(&mut want, &b));
+        if !want.depth.is_empty() {
+            depth_space(|b| named.try_depth(&mut want, &b));
+        }
+        if !want.raster.is_empty() {
+            raster_space(|b| named.try_raster(&mut want, &b));
+        }
         named
     }
 
@@ -110,7 +108,14 @@ impl Named {
     /// depth func with depth off): those are enumerated.
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
         let mut tried = HashSet::new();
+        let mut tried_raster = HashSet::new();
         for g in pack.graphics() {
+            if want.raster.contains(&g.rasterizer_hash)
+                && let Some(regs) = raster_registers(g.packet)
+                && tried_raster.insert((g.rasterizer_hash, regs))
+            {
+                raster_from_registers(regs, |b| self.try_raster(want, &b));
+            }
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
@@ -221,13 +226,76 @@ fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
 /// begins at 0x74 in vertex-shader images (dword 1 = 4) and 0xc8 in
 /// geometry/mesh ones.
 fn registers(packet: &[u8]) -> Option<[u32; 14]> {
-    let word = |o: usize| Some(u32::from_le_bytes(packet.get(o..o + 4)?.try_into().ok()?));
-    let base = if word(4)? == 4 { 0x74 } else { 0xc8 };
+    let base = register_base(packet)?;
     let mut regs = [0; 14];
     for (i, r) in regs.iter_mut().enumerate() {
-        *r = word(base + 0x44 + 4 * i)?;
+        *r = packet_word(packet, base + 0x44 + 4 * i)?;
     }
     Some(regs)
+}
+
+fn packet_word(packet: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        packet.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn register_base(packet: &[u8]) -> Option<usize> {
+    Some(if packet_word(packet, 4)? == 4 {
+        0x74
+    } else {
+        0xc8
+    })
+}
+
+fn raster_registers(packet: &[u8]) -> Option<[u32; 5]> {
+    let base = register_base(packet)?;
+    Some([
+        packet_word(packet, base + 0x28)?,
+        packet_word(packet, base + 0x2c)?,
+        packet_word(packet, base + 0x38)?,
+        packet_word(packet, base + 0x3c)?,
+        packet_word(packet, base + 0x40)?,
+    ])
+}
+
+/// Recover culling, clipping, and the three bias fields from the register
+/// image. The slope is in sixteenth-pixel units and the constant bias is
+/// represented as a float. Check the remaining line and sampling flags
+/// against the compact state hash.
+fn raster_from_registers(
+    [clip, mode, clamp, slope, bias]: [u32; 5],
+    mut f: impl FnMut([u8; RASTER]),
+) {
+    let depth_clip = match clip >> 26 & 3 {
+        0 => 1,
+        3 => 0,
+        _ => return,
+    };
+    let cull = (mode & 3) as u8 + 1;
+    let ccw = 1 - (mode >> 2 & 1) as u8;
+    let slope = f32::from_bits(slope) / 16.0;
+    let bias = f32::from_bits(bias);
+    if cull > 3
+        || !f32::from_bits(clamp).is_finite()
+        || !slope.is_finite()
+        || !(-128.0..=127.0).contains(&bias)
+        || bias.fract() != 0.0
+    {
+        return;
+    }
+    let mut compact = [0u8; RASTER];
+    compact[1..4].copy_from_slice(&[cull, ccw, bias as i8 as u8]);
+    compact[4..8].copy_from_slice(&clamp.to_le_bytes());
+    compact[8..12].copy_from_slice(&slope.to_le_bytes());
+    compact[12] = depth_clip;
+    for fill in [2, 3] {
+        compact[0] = fill;
+        for flags in 0..16 {
+            compact[13..16].copy_from_slice(&[flags & 1, flags >> 1 & 1, flags >> 2]);
+            f(compact);
+        }
+    }
 }
 
 /// Hardware compare functions to D3D12's.
@@ -251,55 +319,76 @@ fn stencil_op(v: u32) -> u8 {
 }
 
 fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
-    let [control, stencil, mask, ..] = *regs;
+    let [control, stencil, mask, back_mask, ..] = *regs;
     let stencil_on = (control & 1) as u8;
     let depth_on = control >> 1 & 1 != 0;
     let off = [1, 1, 1, 8];
-    let (front, back, masks) = if stencil_on != 0 {
-        let front = [
-            stencil_op(stencil),
-            stencil_op(stencil >> 8),
-            stencil_op(stencil >> 4),
-            func(control >> 8),
-        ];
-        let back = if control >> 7 & 1 != 0 {
-            [
-                stencil_op(stencil >> 12),
-                stencil_op(stencil >> 20),
-                stencil_op(stencil >> 16),
-                func(control >> 20),
-            ]
-        } else {
-            front
-        };
-        (front, back, (mask >> 8 & 0xFF, mask >> 16 & 0xFF))
+    let front = [
+        stencil_op(stencil),
+        stencil_op(stencil >> 8),
+        stencil_op(stencil >> 4),
+        func(control >> 8),
+    ];
+    let back = if control >> 7 & 1 != 0 {
+        [
+            stencil_op(stencil >> 12),
+            stencil_op(stencil >> 20),
+            stencil_op(stencil >> 16),
+            func(control >> 20),
+        ]
     } else {
-        (off, off, (0xFF, 0xFF))
+        front
     };
     let (enables, writes, funcs): (&[u8], &[u8], Vec<u8>) = if depth_on {
         (&[1], &[(control >> 2 & 1) as u8], vec![func(control >> 4)])
     } else {
         (&[0, 1], &[0, 1], (1..=8).collect())
     };
-    let mut faces = vec![(front, back)];
-    if stencil_on != 0 {
-        // The second face when back-face stencil is off.
-        faces.push((front, off));
+    let mut faces = vec![(front, back), (front, off)];
+    if stencil_on == 0 {
+        faces.push((off, off));
     }
+    faces.sort_unstable();
+    faces.dedup();
+    let read = (mask >> 8) as u8;
+    let write = (mask >> 16) as u8;
+    let back_read = (back_mask >> 8) as u8;
+    let mut masks = vec![(read, write)];
+    // The engine retains inactive stencil masks in its compact state. In
+    // particular the hardware may zero writes for a keep-only stencil test.
+    if write == 0 {
+        masks.extend([(read, 0xff), (read, read)]);
+    }
+    if stencil_on == 0 {
+        masks.push((0xff, 0xff));
+    }
+    masks.sort_unstable();
+    masks.dedup();
     for &e in enables {
         for &w in writes {
             for &fun in &funcs {
                 for &(front, back) in &faces {
-                    let mut b = [0u8; DEPTH];
-                    b[..6].copy_from_slice(&[e, w, fun, stencil_on, masks.0 as u8, masks.1 as u8]);
-                    b[6..10].copy_from_slice(&front);
-                    b[10..14].copy_from_slice(&back);
-                    b[22..].copy_from_slice(&[1, 1]);
-                    f(b);
-                    if stencil_on == 0 {
-                        b[4] = (mask >> 8) as u8;
-                        b[5] = (mask >> 16) as u8;
-                        f(b);
+                    for &(read, write) in &masks {
+                        let mut b = [0u8; DEPTH];
+                        b[..6].copy_from_slice(&[e, w, fun, stencil_on, read, write]);
+                        b[6..10].copy_from_slice(&front);
+                        b[10..14].copy_from_slice(&back);
+                        b[22..].copy_from_slice(&[1, 1]);
+                        // The packed flag and depth bounds can be absent
+                        // from the pipeline's static depth control word.
+                        for flags in 0..4 {
+                            b[14] = flags & 1;
+                            b[15] = flags >> 1;
+                            f(b);
+                            // Some compact states retain a back-face read
+                            // mask. The common host mask covers both faces
+                            // when it has this same value.
+                            if back_read != 0 && back_read == read {
+                                b[18] = back_read;
+                                f(b);
+                                b[18] = 0;
+                            }
+                        }
                     }
                 }
             }
@@ -334,6 +423,8 @@ fn blend_target(control: u32, mask: u8) -> Vec<[u8; 8]> {
         // Off: the factors are not kept; the defaults and the common ones.
         return [
             [2, 1, 1, 2, 1, 1],
+            [5, 6, 1, 2, 1, 1],
+            [5, 6, 1, 2, 2, 1],
             [5, 6, 1, 2, 6, 1],
             [5, 6, 1, 5, 6, 1],
             [2, 2, 1, 2, 2, 1],

@@ -11,16 +11,21 @@
 //! sequence is matched; any step the simulation does not model leaves the
 //! values it writes unknown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
+use crate::structure::{Atom, LaneExit, Structured};
 
 /// An associative operation and its identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// A sum of 16-bit floats in the low halves (`v_add_f16`), each addition rounded to 16
+    /// bits: not associative, so only the balanced tree over the lanes in their order is
+    /// followed (see [`buddies`]), which is how the compiler sums a wave.
+    AddH,
     MinU,
     MaxU,
     MinI,
@@ -30,16 +35,16 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
-    /// `v_add_f16`: on the low halves (see [`Sym::Half`]).
-    AddH,
 }
 
 impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
-            // The low dwords of a 64-bit sum (the carry is not followed).
+            // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
+            // the high one) is the 32-bit sum of the low dwords
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -56,20 +61,38 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
             Op::MinF => k == 0x7F80_0000,
             Op::MaxF => k == 0xFF80_0000,
-            Op::AddH => k & 0x7FFF == 0,
         }
     }
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+    }
+}
+
+/// Whether the lane sets `a` and `b` are the two halves of one aligned run of lanes: lanes
+/// 2k and 2k+1, then two such pairs side by side, and so on up to the two halves of the
+/// wave. Sums joined only that way form the balanced tree over the lanes in their order,
+/// whichever of the two a lane adds to the other (the addition is commutative).
+fn buddies(a: u64, b: u64) -> bool {
+    let n = a.count_ones();
+    if n != b.count_ones() || !n.is_power_of_two() || n == 64 {
+        return false;
+    }
+    let run = |s: u64| {
+        let first = s.trailing_zeros();
+        (first.is_multiple_of(n) && s >> first == (1u64 << n) - 1).then_some(first)
+    };
+    match (run(a), run(b)) {
+        (Some(x), Some(y)) => x.min(y) % (2 * n) == 0 && x.abs_diff(y) == n,
+        _ => false,
     }
 }
 
@@ -90,17 +113,14 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
-    /// A 16-bit operation's result: the low half is `op` over `lanes` of
-    /// the low halves of `mask ? src : ident`; the high half is that of
-    /// lane `hi`'s `mask ? src : ident` (16-bit results keep the
-    /// register's high half).
-    Half {
-        op: Op,
-        src: Value,
+    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over
+    /// `lanes` of `mask ? f64(lo, hi) : 0.0`.
+    Red64F {
+        lo: Value,
+        hi: Value,
         mask: Value,
-        ident: u32,
         lanes: u64,
-        hi: u32,
+        high: bool,
     },
 }
 
@@ -113,11 +133,10 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over every lane.
+    ActiveF64(Value, Value, Value, bool),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
-    /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
-    /// giving the high half.
-    Half(Op, Value, Value, u32, u32),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -235,7 +254,8 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             && op.identity(ident)
             && oa.is_none_or(|o| o == op)
             && ob.is_none_or(|o| o == op)
-            && (!op.counts() || la & lb == 0) =>
+            && (!op.counts() || la & lb == 0)
+            && (op != Op::AddH || buddies(la, lb)) =>
         {
             Sym::Red {
                 op: Some(op),
@@ -246,69 +266,6 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             }
         }
         _ => Sym::Unknown,
-    }
-}
-
-/// A lane of 16-bit `op` on the low halves of `a` and `b`, the high half
-/// kept from the destination's `old` value.
-fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
-    // A low half: the identity, or `op` over lanes of one masked source.
-    let low = |s: Sym| match s {
-        Sym::K(k) if op.identity(k) => Some(None),
-        Sym::Red {
-            op: None,
-            src,
-            mask,
-            ident,
-            lanes,
-        } if op.identity(ident) => Some(Some((src, mask, ident, lanes))),
-        Sym::Half {
-            op: o,
-            src,
-            mask,
-            ident,
-            lanes,
-            ..
-        } if o == op => Some(Some((src, mask, ident, lanes))),
-        _ => None,
-    };
-    let (src, mask, ident, hi) = match old {
-        Sym::Red {
-            op: None,
-            src,
-            mask,
-            ident,
-            lanes,
-        } if lanes.is_power_of_two() => (src, mask, ident, lanes.trailing_zeros()),
-        Sym::Half {
-            src,
-            mask,
-            ident,
-            hi,
-            ..
-        } => (src, mask, ident, hi),
-        _ => return Sym::Unknown,
-    };
-    let (Some(x), Some(y)) = (low(a), b.and_then(low)) else {
-        return Sym::Unknown;
-    };
-    let mut lanes = 0;
-    for (s, m, i, l) in [x, y].into_iter().flatten() {
-        if (s, m, i) != (src, mask, ident) || lanes & l != 0 {
-            return Sym::Unknown;
-        }
-        lanes |= l;
-    }
-    if lanes == 0 {
-        return Sym::Unknown;
-    }
-    Sym::Half {
-        op,
-        src,
-        mask,
-        ident,
-        lanes,
-        hi,
     }
 }
 
@@ -353,12 +310,27 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+                && *dc != NULL
+                && let Some(w) = inst.write(Reg::S(*dc))
+            {
+                let sym = match *s0 {
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Literal(x) => Sym::K(x),
+                    _ => Sym::Unknown,
+                };
+                uni.insert(w, sym);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -412,6 +384,130 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
+            continue;
+        }
+        if name == "v_add_f64"
+            && !modifiers
+            && v.dpp.is_none()
+            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
+            && let (Some(dst_lo), Some(dst_hi)) =
+                (inst.write(Reg::V(dreg)), inst.write(Reg::V(dreg + 1)))
+        {
+            let pair_lanes = |op: Option<&Operand>| -> Option<(Vec<Sym>, Vec<Sym>)> {
+                match *op? {
+                    Operand::Vector { reg, .. } => Some((
+                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Vector {
+                                reg: reg + 1,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    Operand::Scalar { code, .. } if code != NULL => Some((
+                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Scalar {
+                                code: code + 1,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    _ => None,
+                }
+            };
+            let old_lo = lanes(
+                &Operand::Vector {
+                    reg: dreg,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let old_hi = lanes(
+                &Operand::Vector {
+                    reg: dreg + 1,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64)> {
+                match (lo_s, hi_s) {
+                    (
+                        Sym::Red {
+                            op: None,
+                            src: lo,
+                            mask: ml,
+                            ident: 0,
+                            lanes: ll,
+                        },
+                        Sym::Red {
+                            op: None,
+                            src: hi,
+                            mask: mh,
+                            ident: 0,
+                            lanes: lh,
+                        },
+                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll)),
+                    (
+                        Sym::Red64F {
+                            lo: lo1,
+                            hi: hi1,
+                            mask: m1,
+                            lanes: l1,
+                            high: false,
+                        },
+                        Sym::Red64F {
+                            lo: lo2,
+                            hi: hi2,
+                            mask: m2,
+                            lanes: l2,
+                            high: true,
+                        },
+                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => Some((lo1, hi1, m1, l1)),
+                    _ => None,
+                }
+            };
+            let mut out_lo = vec![Sym::Unknown; wave as usize];
+            let mut out_hi = vec![Sym::Unknown; wave as usize];
+            if let (Some((alo, ahi)), Some((blo, bhi))) =
+                (pair_lanes(v.src.first()), pair_lanes(v.src.get(1)))
+            {
+                for l in 0..wave as usize {
+                    let (rl, rh) = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
+                        (Some((lo1, hi1, m1, la)), Some((lo2, hi2, m2, lb)))
+                            if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 =>
+                        {
+                            (
+                                Sym::Red64F {
+                                    lo: lo1,
+                                    hi: hi1,
+                                    mask: m1,
+                                    lanes: la | lb,
+                                    high: false,
+                                },
+                                Sym::Red64F {
+                                    lo: lo1,
+                                    hi: hi1,
+                                    mask: m1,
+                                    lanes: la | lb,
+                                    high: true,
+                                },
+                            )
+                        }
+                        _ => (Sym::Unknown, Sym::Unknown),
+                    };
+                    out_lo[l] = if exec >> l & 1 != 0 { rl } else { old_lo[l] };
+                    out_hi[l] = if exec >> l & 1 != 0 { rh } else { old_hi[l] };
+                }
+            }
+            vec.insert(dst_lo, out_lo);
+            vec.insert(dst_hi, out_hi);
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
@@ -550,12 +646,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_add_f16", Some(a)) if v.opsel == 0 => {
-                let b = src(1).unwrap_or_default();
-                (0..wave as usize)
-                    .map(|l| half(Op::AddH, a[l], b.get(l).copied(), old[l]))
-                    .collect()
-            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -621,14 +711,13 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-        Sym::Half {
-            op,
-            src,
-            mask,
-            ident,
-            lanes,
+        Sym::Red64F {
+            lo,
             hi,
-        } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -672,6 +761,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Red64F {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
             _ => None,
         };
     }
@@ -727,6 +823,450 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         _ => return None,
     }
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
+}
+
+/// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
+/// those outside the saved EXEC (s[4:5]) with 0.
+#[cfg(test)]
+pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
+    0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+    0xD501_0001,
+    0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+    0x3802_02E9,
+    0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+    0x3802_02E9,
+    0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+    0x3802_02E9,
+    0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+    0x3802_02FA,
+    0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
+    0xD778_0002,
+    0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+    0x3802_0302, // v_or_b32 v1, v2, v1
+    0xD760_0007,
+    0x0001_4101, // v_readlane_b32 s7, v1, 32
+    0x3802_0207, // v_or_b32 v1, s7, v1
+    0xD760_0007,
+    0x0001_0101, // v_readlane_b32 s7, v1, 0
+    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+];
+
+/// What a register value holds, for [`wave_local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wave {
+    /// Nothing that depends on how the threads are divided into waves.
+    Plain,
+    /// The number of the wave's first lane in a mask (`s_ff1`).
+    First,
+    /// A reduction over the wave's lanes: a count, a sum, a minimum...
+    Total(Op),
+    /// A count or sum over the lanes below this one.
+    Prefix,
+    /// Derived from what a first-lane atomic returned: the slots the wave reserved.
+    Base,
+    /// A mix the idiom does not make.
+    Mixed,
+}
+
+/// Whether a console wave64 program may run with each host wave as a wave of its own
+/// (`lower::with_local_waves`): its wave-wide values are used only as the allocation idiom uses
+/// them, which does not care how the threads are divided into waves. A first-lane number only
+/// picks the first lane; a count or sum only goes into that lane's atomic on a shared counter;
+/// a prefix only goes onto the base that atomic returned; the first lane does nothing else.
+/// Anything else done with them takes one wave to be the whole thread group (a tile's result,
+/// say) and is refused, with the offset and what was found.
+/// Lane masks read as numbers by other instructions and lane reads outside whole-wave sections
+/// are stopped by the lowering itself.
+// shortcut: `v_readfirstlane` of a value that differs between lanes is taken as it is (this
+// host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
+// the only mix of old and new lanes that is looked at.
+pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
+    type Why = &'static str;
+    const FIRST: Why = "a wave's first-lane number used as data";
+    const TOTAL: Why = "a count or sum over the wave used as data";
+    const PREFIX: Why = "a count or sum over the lanes below used without a reserved base";
+    const MIXED: Why = "a value that depends on the wave on some paths only";
+    const EFFECT: Why = "a write by the wave's first lane other than its reservation";
+    fn of(kind: &HashMap<Value, Wave>, v: Option<Value>) -> Wave {
+        v.and_then(|v| kind.get(&v).copied()).unwrap_or(Wave::Plain)
+    }
+    fn put(kind: &mut HashMap<Value, Wave>, v: Value, k: Wave) {
+        if k == Wave::Plain {
+            kind.remove(&v);
+        } else {
+            kind.insert(v, k);
+        }
+    }
+    let wild = |k: Wave| !matches!(k, Wave::Plain | Wave::Base);
+    let why = |k: Wave| match k {
+        Wave::First => FIRST,
+        Wave::Total(_) => TOTAL,
+        Wave::Prefix => PREFIX,
+        _ => MIXED,
+    };
+    // a mask (by its low dword) under which only a wave's first lane runs
+    let first_mask = |firsts: &HashSet<Value>, m: Option<Value>| {
+        m.and_then(|m| st.masks.get(&m)).is_some_and(|&b| {
+            st.bools
+                .support(b)
+                .iter()
+                .any(|a| matches!(a, Atom::Lane(v) if firsts.contains(v)))
+        })
+    };
+    // One instruction outside a section: the kind of what it writes, and whether it is a
+    // first lane's reservation.
+    let step = |insts: &[Inst], kind: &HashMap<Value, Wave>, firsts: &mut HashSet<Value>| -> Result<(Wave, bool), Why> {
+        let (inst, before) = insts.split_last().expect("current instruction");
+        let name = inst.name();
+        let val = |op: &Operand| match *op {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            _ => None,
+        };
+        let extra;
+        let ops: &[Operand] = match &inst.fields {
+            Fields::Valu(v) => &v.src,
+            Fields::Sop { dst, src, .. } if matches!(name, "s_addk_i32" | "s_mulk_i32") => {
+                extra = src.iter().chain(dst).copied().collect::<Vec<_>>();
+                &extra
+            }
+            Fields::Sop { src, .. } => src,
+            Fields::Buffer { data, .. } if name.contains("_atomic_") || name.contains("_store_") => {
+                data.as_slice()
+            }
+            Fields::Ds { data, gds: false, .. } if name == "ds_add_rtn_u32" => data,
+            _ => &[],
+        };
+        let kinds: Vec<Wave> = ops.iter().map(|o| of(kind, val(o))).collect();
+        // Everything else it reads (addresses, descriptors, SCC, the high dwords of wide
+        // operands) must not depend on the wave. Not EXEC, and not the old value of a VGPR it
+        // writes, which only the lanes outside EXEC keep.
+        let named: Vec<Value> = ops.iter().filter_map(&val).collect();
+        for &(r, v) in &inst.reads {
+            let kept = matches!(r, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == r);
+            if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) || kept || named.contains(&v) {
+                continue;
+            }
+            let k = of(kind, Some(v));
+            if wild(k) {
+                return Err(why(k));
+            }
+        }
+        let w = kinds.iter().copied().find(|&k| wild(k)).unwrap_or(Wave::Mixed);
+        let sum = |k: Wave| k == Wave::Total(Op::AddU);
+        let is_mask = |o: &Operand| {
+            val(o).is_some_and(|v| st.masks.contains_key(&v) || st.highs.contains_key(&v))
+        };
+        let mut reserved = false;
+        let out = match (name, &kinds[..]) {
+            ("s_ff1_i32_b64" | "s_ff1_i32_b32", _) if ops.first().is_some_and(is_mask) => Wave::First,
+            ("s_bcnt1_i32_b64" | "s_bcnt1_i32_b32", _) if ops.first().is_some_and(is_mask) => {
+                Wave::Total(Op::AddU)
+            }
+            // bits of a mask below the lane; with -1 for the mask, the lane's number
+            ("v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32", [_, b]) => {
+                match (matches!(ops[0], Operand::Scalar { .. }), *b) {
+                    (_, Wave::Prefix) | (true, Wave::Plain | Wave::Base) => Wave::Prefix,
+                    (false, Wave::Plain | Wave::Base) => Wave::Plain,
+                    (_, k) => return Err(why(k)),
+                }
+            }
+            // nothing wave-dependent goes in; what derives from a reserved base stays marked
+            _ if !kinds.iter().any(|&k| wild(k)) => {
+                let derives = matches!(inst.fields, Fields::Valu(_) | Fields::Sop { .. });
+                if derives && kinds.contains(&Wave::Base) { Wave::Base } else { Wave::Plain }
+            }
+            ("v_mov_b32" | "s_mov_b32", [k]) => *k,
+            ("v_cmp_eq_i32" | "v_cmp_eq_u32" | "v_cmpx_eq_i32" | "v_cmpx_eq_u32", [a, b]) => {
+                // the lane whose own number is the first lane's
+                let lane = match (*a, *b) {
+                    (Wave::First, k) if !wild(k) => &ops[1],
+                    (k, Wave::First) if !wild(k) => &ops[0],
+                    _ => return Err(why(w)),
+                };
+                if !matches!(lane, Operand::Vector { .. }) {
+                    return Err(FIRST);
+                }
+                let mask = match &inst.fields {
+                    _ if name.starts_with("v_cmpx") => inst.write(Reg::S(EXEC)),
+                    Fields::Valu(v) => match v.dst {
+                        Some(Operand::Scalar { code, .. }) => inst.write(Reg::S(code)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                firsts.extend(mask);
+                Wave::Plain
+            }
+            ("v_add_nc_u32" | "s_add_i32", [a, b]) => match (*a, *b) {
+                (Wave::Prefix, Wave::Base) | (Wave::Base, Wave::Prefix) => Wave::Base,
+                (Wave::Prefix, Wave::Plain | Wave::Prefix) | (Wave::Plain, Wave::Prefix) => Wave::Prefix,
+                (x, y) if sum(x) && sum(y) => x,
+                _ => return Err(why(w)),
+            },
+            ("v_sub_nc_u32" | "s_sub_i32", [a, b]) => match (*a, *b) {
+                (Wave::Base, Wave::Prefix) => Wave::Base,
+                (Wave::Prefix, Wave::Plain) => Wave::Prefix,
+                (Wave::Plain, y) if sum(y) && matches!(ops[0], Operand::Const(128)) => y,
+                _ => return Err(why(w)),
+            },
+            ("s_mul_i32" | "v_mul_lo_u32" | "v_mul_u32_u24", [a, b]) => match (*a, *b) {
+                (x, Wave::Plain) | (Wave::Plain, x) if sum(x) || x == Wave::Prefix => x,
+                _ => return Err(why(w)),
+            },
+            ("s_lshl_b32", [x, Wave::Plain]) | ("v_lshlrev_b32", [Wave::Plain, x])
+                if sum(*x) || *x == Wave::Prefix =>
+            {
+                *x
+            }
+            ("v_lshl_add_u32", [Wave::Prefix, Wave::Plain, c]) if !wild(*c) => {
+                if *c == Wave::Base { Wave::Base } else { Wave::Prefix }
+            }
+            // the reservation: the first lane adds its wave's total to a shared counter
+            ("ds_add_rtn_u32", [Wave::Total(Op::AddU)])
+                if lds_counter(before, inst) && first_mask(firsts, inst.read(Reg::S(EXEC))) =>
+            {
+                reserved = true;
+                Wave::Base
+            }
+            (_, [Wave::Total(op)]) if name.contains("_atomic_") => {
+                let want = match op {
+                    Op::AddU => "buffer_atomic_add",
+                    Op::MinU => "buffer_atomic_umin",
+                    Op::MaxU => "buffer_atomic_umax",
+                    Op::MinI => "buffer_atomic_smin",
+                    Op::MaxI => "buffer_atomic_smax",
+                    Op::Or => "buffer_atomic_or",
+                    Op::And => "buffer_atomic_and",
+                    Op::Xor => "buffer_atomic_xor",
+                    _ => "",
+                };
+                if name != want || !first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                    return Err(TOTAL);
+                }
+                reserved = true;
+                Wave::Base
+            }
+            _ => return Err(why(w)),
+        };
+        Ok((out, reserved))
+    };
+    let sections: Vec<_> = (0..p.blocks.len()).map(|b| sections(p, b)).collect();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let pass = |kind: &mut HashMap<Value, Wave>, firsts: &mut HashSet<Value>, check: bool| -> Result<(), (usize, Why)> {
+        for &b in &order {
+            let block = &p.blocks[b];
+            for phi in &block.phis {
+                let mut k = Wave::Plain;
+                for (n, &a) in phi.args.iter().enumerate() {
+                    let x = of(kind, Some(a));
+                    k = match (k, x) {
+                        _ if n == 0 => x,
+                        (k, x) if k == x => k,
+                        (Wave::Plain, m @ (Wave::Base | Wave::Prefix))
+                        | (m @ (Wave::Base | Wave::Prefix), Wave::Plain) => m,
+                        _ => Wave::Mixed,
+                    };
+                }
+                put(kind, phi.value, k);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                // inside a whole-wave section: what the simulation found each value to be
+                if let Some((_, sec)) = sections[b].iter().find(|(s, sec)| i > **s && i < sec.end) {
+                    for &(_, w) in &inst.writes {
+                        let k = match sec.shapes.get(&w) {
+                            None => Wave::Mixed,
+                            Some(&Shape::K(_)) => Wave::Plain,
+                            Some(&Shape::Value(v)) => of(kind, Some(v)),
+                            Some(&Shape::Masked(src, _, _)) => of(kind, Some(src)),
+                            Some(&Shape::Active(op, src, mask, _)) => match of(kind, Some(src)) {
+                                Wave::Plain | Wave::Base => Wave::Total(op),
+                                // the first lane's own sum of a total is that total
+                                Wave::Total(o) if o == op && first_mask(firsts, Some(mask)) => Wave::Total(op),
+                                _ => Wave::Mixed,
+                            },
+                            Some(&Shape::Prefix(Op::AddU, src, mask, _, _)) => match of(kind, Some(src)) {
+                                Wave::Plain | Wave::Base => Wave::Prefix,
+                                Wave::Total(Op::AddU) if first_mask(firsts, Some(mask)) => Wave::Prefix,
+                                _ => Wave::Mixed,
+                            },
+                            Some(_) => Wave::Mixed,
+                        };
+                        put(kind, w, k);
+                    }
+                    continue;
+                }
+                let name = inst.name();
+                if name.starts_with("s_cbranch") {
+                    continue; // with the block's exit, below
+                }
+                let (k, reserved) = match step(&block.insts[..=i], kind, firsts) {
+                    Ok(r) => r,
+                    Err(why) if check => return Err((inst.machine.offset, why)),
+                    Err(_) => (Wave::Mixed, false),
+                };
+                // the same test as `Lower::inst`'s `effect`
+                let effect = matches!(inst.fields, Fields::Exp { .. })
+                    || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+                    || name.contains("store")
+                    || name.contains("atomic")
+                    || matches!(inst.fields, Fields::Ds { .. })
+                        && !(name.starts_with("ds_read")
+                            || name.starts_with("ds_swizzle")
+                            || name.contains("permute"));
+                if check && effect && !reserved && first_mask(firsts, inst.read(Reg::S(EXEC))) {
+                    return Err((inst.machine.offset, EFFECT));
+                }
+                let guarded = st.guards[b][i].is_some();
+                for &(r, w) in &inst.writes {
+                    let mut kw = match r {
+                        // "some lane is counted" keeps the count's kind; any other SCC is one bit of data
+                        Reg::Scc if !name.starts_with("s_bcnt1") => {
+                            if wild(k) { Wave::Mixed } else { Wave::Plain }
+                        }
+                        _ => k,
+                    };
+                    // a guarded write leaves the old value in the lanes outside EXEC
+                    if guarded
+                        && matches!(r, Reg::V(_))
+                        && kw == Wave::Plain
+                        && matches!(of(kind, inst.read(r)), Wave::First | Wave::Total(_) | Wave::Prefix)
+                    {
+                        kw = Wave::Mixed;
+                    }
+                    put(kind, w, kw);
+                }
+            }
+            // a branch on "some lane is counted": fine where the structure made it the lane's
+            // own bit (the mask is EXEC under a scalar condition)
+            if check
+                && let Some(last) = block.insts.last()
+                && last.name().starts_with("s_cbranch_scc")
+                && let Some(scc) = last.read(Reg::Scc)
+                && wild(of(kind, Some(scc)))
+            {
+                let own = matches!(st.exits[b], LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().any(|a| matches!(a, Atom::Uniform(v) if *v == scc)));
+                if !own {
+                    return Err((last.machine.offset, TOTAL));
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut kind: HashMap<Value, Wave> = HashMap::new();
+    let mut firsts: HashSet<Value> = HashSet::new();
+    // to a fixpoint (values carried around loops), then once more to say what is wrong
+    let mut settled = false;
+    for _ in 0..16 {
+        let before = (kind.clone(), firsts.len());
+        pass(&mut kind, &mut firsts, false)?;
+        if (&before.0, before.1) == (&kind, firsts.len()) {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        return Err((0, MIXED));
+    }
+    pass(&mut kind, &mut firsts, true)
+}
+
+/// Splitting a reservation must not move it to another counter when the first lane changes.
+fn lds_counter(before: &[Inst], inst: &Inst) -> bool {
+    let Fields::Ds { gds: false, addr: Some(Operand::Vector { reg, .. }), .. } = inst.fields else {
+        return false;
+    };
+    let r = Reg::V(reg);
+    let Some(v) = inst.read(r) else { return false };
+    before.iter().rev().find(|i| i.write(r) == Some(v)).is_some_and(|i| {
+        i.name() == "v_mov_b32"
+            && i.read(Reg::S(EXEC)) == inst.read(Reg::S(EXEC))
+            && matches!(&i.fields, Fields::Valu(v) if matches!(v.src.as_slice(),
+                [Operand::Const(128..=192) | Operand::Literal(_)]))
+    })
+}
+
+/// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
+/// some lanes run (`all` marks blocks reached by every lane). Returns which IR blocks
+/// need a group barrier at entry or exit, or `None` if barriers cannot keep console order.
+///
+/// The console runs the wave's lanes in step, so an LDS write is seen by every later read. Two
+/// host waves keep that order if they meet between any two accesses of which one writes. A
+/// barrier must be run by every thread, so it cannot stand in a lane branch's region; but
+/// every way into and out of such a region passes a block all lanes run, and the waves meet
+/// there: before the exit of an all-lane block into a region with LDS accesses, and at the
+/// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
+/// barrier as before. What that cannot order is a write and a read inside one region (blocks
+/// joined without an all-lane block between them): refused.
+/// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+pub(super) fn lds_meetings(
+    p: &Program,
+    st: &crate::structure::Structured,
+    all: &[bool],
+) -> Option<Vec<(bool, bool)>> {
+    use crate::structure::LaneExit;
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // regions: blocks not every lane runs, joined by the edges between them
+    let mut region: Vec<usize> = (0..n).collect();
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    // per region: LDS reads, LDS writes
+    let mut reads = vec![false; n];
+    let mut writes = vec![false; n];
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for i in &block.insts {
+            let name = i.name();
+            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if name.starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+            }
+        }
+    }
+    if (0..n).any(|r| reads[r] && writes[r]) {
+        return None;
+    }
+    let mut meet = vec![(false, false); n];
+    for b in 0..n {
+        for t in succ(b) {
+            if all[b] && !all[t] {
+                let r = find(&mut region, t);
+                meet[b].1 |= reads[r] || writes[r];
+            } else if !all[b] && all[t] {
+                let r = find(&mut region, b);
+                meet[t].0 |= reads[r] || writes[r];
+            }
+        }
+    }
+    Some(meet)
 }
 
 #[cfg(test)]
@@ -951,6 +1491,67 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
+    }
+
+    /// `WaveActiveSum` of 16-bit floats, as compiled in
+    /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (0x19c on): the tree the
+    /// lowering reproduces. A tree in another order is not followed.
+    #[test]
+    fn a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree() {
+        let words = |first: [u32; 2], second: [u32; 2]| {
+            [
+                0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+                0xD501_0001,
+                0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+                first[0],
+                first[1],
+                second[0],
+                second[1],
+                0x6402_02E9,
+                0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+                0x6402_02FA,
+                0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+                0xD778_0002,
+                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+                0x6402_0302, // v_add_f16 v1, v2, v1
+                0xD760_0007,
+                0x0001_4101, // v_readlane_b32 s7, v1, 32
+                0x6402_0207, // v_add_f16 v1, s7, v1
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            ]
+        };
+        let pairs = [0x6402_02E9, 0xDE54_C101]; // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        let quads = [0x6402_02E9, 0x9360_1201]; // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        let shape = |w: &[u32]| {
+            let p = build(w, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
+        };
+        let (found, want) = shape(&words(pairs, quads));
+        assert_eq!(found, Some(want));
+        // lanes two apart first, neighbours second: every lane counted once, but
+        // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
+        let (found, _) = shape(&words(quads, pairs));
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn buddies_are_the_two_halves_of_an_aligned_run() {
+        assert!(buddies(0b01, 0b10));
+        assert!(buddies(0b1100, 0b0011));
+        assert!(buddies(0xF0, 0x0F));
+        assert!(buddies(u64::from(u32::MAX), u64::from(u32::MAX) << 32));
+        assert!(!buddies(0b010, 0b100)); // lanes 1 and 2: not one pair
+        assert!(!buddies(0b0011, 0b110000)); // pairs 0 and 2
+        assert!(!buddies(0b0101, 0b1010)); // not runs
+        assert!(!buddies(0b01, 0b1100)); // unequal
+        assert!(!buddies(0b11, 0b11));
     }
 
     #[test]

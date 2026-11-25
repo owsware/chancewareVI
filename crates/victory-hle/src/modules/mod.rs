@@ -2,7 +2,7 @@
 //!
 //! Adding an API: write an `extern "system"` function named exactly like
 //! the import, then list it with `hle_export!` in the module's `module()`.
-//! Run `victory census` over your titles to see what is still missing.
+//! Run `chanceware census` over your titles to see what is still missing.
 //!
 //! Planned areas (driven by census results, not by completeness):
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
@@ -17,8 +17,6 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
-pub mod fidelityfx;
-#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -28,7 +26,6 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
-pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -69,14 +66,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
-    all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
-    #[cfg(windows)]
-    if fidelityfx::serving() {
-        all.push(fidelityfx::module());
-    }
     all
 }

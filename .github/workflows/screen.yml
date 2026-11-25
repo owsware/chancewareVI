@@ -1,0 +1,80 @@
+name: Screen
+
+# The first screen for inherited code: a pull request that touches something which must be read before anything is
+# built fails this check and lists what it touched. The failure is a flag, not a verdict: it stays red, and a
+# maintainer reads the whole diff before merging. Nothing from the pull request is executed: this workflow reads the
+# base and head trees with `git diff --name-status` and `--numstat` only.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    name: screen
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 'Read first: files that must not be built unreviewed'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff --name-status "$BASE" "$HEAD" > changed.txt
+          git diff --numstat "$BASE" "$HEAD" > numstat.txt
+          paths=$(awk -F'\t' '{ print $2; if ($3 != "") print $3 }' changed.txt)
+          hits=$(printf '%s\n' "$paths" | grep -E \
+            '(^|/)(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?)$|(^|/)\.cargo/|(^|/)build\.rs$|(^|/)xtask/|(^|/)[^/]*proc-macro[^/]*/|(^|/)\.github/|\.(sh|ps1|py|bat|cmd|js|mjs)$|(^|/)(CLAUDE|AGENTS)\.md$|(^|/)\.(claude|vscode)/' \
+            || true)
+          binaries=$(awk -F'\t' '$1 == "-" { print $3 }' numstat.txt)
+          {
+            echo "## First screen"
+            echo ""
+            if [ -n "$hits" ]; then
+              echo "This pull request touches files that must be read before anyone builds it:"
+              echo '```'
+              echo "$hits"
+              echo '```'
+            fi
+            if [ -n "$binaries" ]; then
+              echo "New or changed binary files:"
+              echo '```'
+              echo "$binaries"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$hits" ] || [ -n "$binaries" ]; then
+            echo "needs a maintainer's read before anyone builds it"
+            exit 1
+          fi
+          echo "Screen: clean."
+      - name: 'For the reader: added lines that start processes, load libraries, open sockets or read credentials'
+        continue-on-error: true
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git diff -U0 "$BASE" "$HEAD" \
+            | grep -inE '^\+.*(CreateProcess|ShellExecute|WinExec|std::process::Command|Command::new|LoadLibrary|dlopen|CreateRemoteThread|WriteProcessMemory|VirtualAllocEx|SetWindowsHookEx|TcpStream|UdpSocket|TcpListener|WinHttp|WinINet|URLDownloadToFile|USERPROFILE|APPDATA|LOCALAPPDATA|GITHUB_TOKEN|ANTHROPIC_|OPENAI_|AWS_|include_bytes|include_str|base64)' \
+            > risky.txt || true
+          {
+            echo "## For the reader (not a failure)"
+            echo ""
+            if [ -s risky.txt ]; then
+              echo "Added lines worth a look, from the screen's patterns:"
+              echo '```'
+              head -100 risky.txt
+              echo '```'
+            else
+              echo "None of the screen's patterns appear in added lines."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "listed $(wc -l < risky.txt) line(s) for the reader"

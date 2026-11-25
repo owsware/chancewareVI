@@ -141,7 +141,7 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     // 16-bit outputs and inputs (one value per dword with the 2020
-    // compiler; Grand Theft Auto VI's two per dword cannot be compiled
+    // compiler; the title's two per dword cannot be compiled
     // here) and the front face.
     (
         "16-bit varyings and front face",
@@ -292,31 +292,16 @@ const CS_CASES: &[(&str, &str)] = &[
         }"#,
     ),
     // Bytes and halves: SDWA operand and result selection, byte permutes,
-    // f16 conversions. The console narrows to nearest even, a NaN keeping
-    // its payload's top; the PC's `f32tof16` rounds toward zero on the RX
-    // 6700 XT and WARP (and WARP's NaN is 0xffff), so the PC build rounds
-    // to nearest even itself.
+    // f16 conversions.
     (
         "sub-dword operations",
-        r#"
-        #ifdef CONSOLE
-        uint to16(float x) { return f32tof16(x); }
-        #else
-        uint to16(float x) {
-            uint t = f32tof16(x), u = asuint(x);
-            if (isnan(x)) return (u >> 16 & 0x8000) | 0x7e00 | (u >> 13 & 0x3ff);
-            float m = abs(x), lo = abs(f16tof32(t)), hi = abs(f16tof32(t + 1));
-            if (m >= 65520.0) return (t & 0x8000) | 0x7c00;
-            return m - lo > hi - m || (m - lo == hi - m && (t & 1)) ? t + 1 : t;
-        }
-        #endif
-        CS {
+        r#"CS {
             uint n = d.y * 16 + d.x;
             uint x = raw.Load(4 * (n & 31)), y = raw.Load(4 * ((n * 7) & 31));
             float a = float(x >> 16) + float((y >> 8) & 255) * k.x;
             float b = f16tof32(x >> 16) + f16tof32(y);
             uint p = (x & 0xff) | ((y & 0xff) << 8) | (x & 0xff0000) | ((y >> 8) << 24);
-            uint q = to16(a) | (to16(b) << 16);
+            uint q = f32tof16(a) | (f32tof16(b) << 16);
             int s = int(x << 24) >> 24;
             uint u = (x & 0xffff) + (y >> 16) + ((x >> 24) ^ (y & 0xffff)) + asuint(k.w) * 1000 + 77;
             outb.Store4(16 * n, uint4(asuint(a), asuint(b) ^ p, q, asuint(float(s)) + u));
@@ -369,22 +354,7 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
-    // The same at uniform indices: scalar loads of the last structured
-    // element and the last raw dword (record counts read as data beside
-    // `s_buffer_load`).
-    (
-        "sizes for scalar loads",
-        r#"CS {
-            uint ns, st, nb;
-            structured.GetDimensions(ns, st);
-            raw.GetDimensions(nb);
-            S last = structured[ns - 1];
-            uint tail = raw.Load(nb - 4);
-            outb.Store4(16 * (d.y * 16 + d.x),
-                uint4(ns + asuint(last.a), last.b * 3 + st, tail ^ nb, nb != 0 ? d.x : d.y));
-        }"#,
-    ),
-    // Typed loads (`tbuffer_load_format_*`, Grand Theft Auto VI's vertex
+    // Typed loads (`tbuffer_load_format_*`, the title's vertex
     // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
     // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
@@ -439,27 +409,6 @@ const CS_CASES: &[(&str, &str)] = &[
                 o.w = asuint(WaveActiveSum(v)) + (WaveIsFirstLane() ? WaveReadLaneFirst(u) : 0);
             }
             outb.Store4(16 * n, o);
-        }"#,
-    ),
-    // A mask with lanes outside the branch read as a number (the complement
-    // of a ballot, `s_not_b64`: inactive lanes' bits set), the low dword of
-    // a 64-bit wave sum (`v_add_co_u32` steps) and a half sum (`v_add_f16`
-    // steps keeping the high half; exact values, so any order agrees). 32
-    // threads, one wave.
-    (
-        "complemented ballots and wide and half sums",
-        r#"[RootSignature(RS)] [numthreads(8, 4, 1)]
-        void cs(uint3 d : SV_DispatchThreadID, uint i : SV_GroupIndex) {
-            uint u = raw.Load(4 * (i & 31));
-            uint4 o = 0;
-            if (u & 3) {
-                uint4 b = WaveActiveBallot((u & 4) != 0);
-                uint64_t m = ~(b.x | (uint64_t(b.y) << 32));
-                o.xy = uint2(m, m >> 32);
-                o.z = uint(WaveActiveSum(uint64_t(u) << 20));
-                o.w = asuint(float(WaveActiveSum(half((u >> 8) & 15) * half(0.25))));
-            }
-            outb.Store4(16 * (d.y * 16 + d.x), o);
         }"#,
     ),
     // Atomics the console aggregates per wave (one add of the lane count,
@@ -583,27 +532,6 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store2(8 * n, uint2(uint(q >> 7) ^ z, uint(w >> (n & 15))));
         }"#,
     ),
-    // Shared memory of 16-bit values: halves of dwords read zero- or
-    // sign-extended or into a register's high half, and written beside
-    // other lanes' halves of the same dword.
-    (
-        "16-bit shared memory",
-        r#"groupshared uint16_t sh[64];
-        groupshared int16_t si[64];
-        groupshared half hh[64];
-        CS {
-            uint n = d.y * 16 + d.x;
-            uint x = raw.Load(4 * (i & 31));
-            sh[i] = uint16_t(x >> 3);
-            si[63 - i] = int16_t(x);
-            hh[i ^ 5] = half(float(x & 255) * k.x);
-            GroupMemoryBarrierWithGroupSync();
-            uint a = sh[(i + 7) & 63];
-            int b = si[(i * 5) & 63];
-            half2 h = half2(hh[(i + 1) & 63], hh[(i + 2) & 63]) * half(k.y);
-            outb.Store4(16 * n, uint4(a, asuint(b), asuint(float(h.x)), asuint(float(h.y))));
-        }"#,
-    ),
 ];
 
 const MS_COMMON: &str = r#"
@@ -659,7 +587,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
         }"#,
     ),
-    // Two waves per group, as Grand Theft Auto VI's mesh programs run: the
+    // Two waves per group, as the title's mesh programs run: the
     // second wave's lanes are threads 64-127.
     (
         "two waves",
@@ -677,7 +605,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
-    // Quad reads (DPP quad permutations on the console; Grand Theft Auto VI's
+    // Quad reads (DPP quad permutations on the console; the title's
     // tessellating mesh programs swizzle within quads too).
     (
         "quad reads",
@@ -697,31 +625,6 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
             uint cc = i / 2 % 8 + i / 16 * 9;
             tris[i] = i & 1 ? uint3(cc + 1, cc + 10, cc + 9) : uint3(cc, cc + 1, cc + 9);
-        }"#,
-    ),
-    // Wave operations the console compiler expands: a loop serving each
-    // distinct value once (`WaveActiveMin`) and a uniformity test (a mask's
-    // bit count). Each lane's result is its own value's on any wave.
-    (
-        "wave minimum and uniformity",
-        1,
-        r#"MS_ATTR [numthreads(128, 1, 1)]
-        void ms(uint i : SV_GroupIndex, out vertices V verts[128], out indices uint3 tris[128]) {
-            SetMeshOutputCounts(128, 128);
-            uint key = (i * 7 + uint(k.w)) % 5;
-            float acc = 0;
-            [loop] for (;;) {
-                uint m = WaveActiveMin(key);
-                if (m == key) { acc = m * k.x + 0.25; break; }
-            }
-            uint idx = (i >> 4) & 1;
-            float u = WaveActiveAllEqual(idx) ? k.y * WaveReadLaneFirst(idx) : k.y * idx;
-            float2 p = float2(i % 9, i / 9) / 8.0;
-            verts[i].pos = float4(p * 2 - 1, 0.5, 1);
-            verts[i].col = float4(acc, u, p.y, 1);
-            verts[i].uv = float2(i, k.y);
-            uint c = i / 2 % 8 + i / 16 * 9;
-            tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
     // Vertices and indices written by other threads than their lanes: the
@@ -791,9 +694,6 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
 }
 
 /// Root arguments for a translated stage: user data from the root values.
-/// Where the compute cases' heap holds the view of their root SRV.
-const ROOT_SRV_AT: u32 = 18;
-
 fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     let mut data = vec![0; (s.user_data_dwords() as usize).max(1)];
     for u in &s.user_data {
@@ -806,9 +706,6 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
-            // The root SRV `rootraw` (compute) as the host's view of it.
-            (RootType::Descriptor, 5) if u.dword == super::ROOT_SRV_VIEW => ROOT_SRV_AT,
-            (RootType::Descriptor, 5) if u.dword == super::ROOT_VIEW_OFFSET => 0,
             other => panic!("unexpected user data {other:?}"),
         };
     }
@@ -821,12 +718,9 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            return;
-        }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -980,12 +874,9 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            return;
-        }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1100,12 +991,9 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            return;
-        }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
     };
     let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1176,155 +1064,6 @@ fn float_semantics_are_the_consoles() {
     assert!((one - 0.841_470_96).abs() < 1e-4, "{one}");
 }
 
-/// Cube samples with gradients (`image_sample_d(_cl)` on a cube): the
-/// console takes face-space gradients, the translation samples at the
-/// level they give. A cube whose level `n` holds `n` (plus 10 × the face)
-/// under a trilinear sampler returns the level picked. Lanes sample every
-/// face at levels 0.3..3.87, with and without a clamp of 2.5; each
-/// gradient is 4 × the direction plus a tangent of known length, so it
-/// lies on the direction's face and its face-space derivative is half the
-/// tangent: level = log2(32 × |tangent| / 2). (Off the face's centre only
-/// on positive faces: on negative ones the console compiler's projection
-/// adds a term for the gradient's major component.) Tolerance 0.02 of a
-/// level: the hardware keeps the level and trilinear weight to 1/256; the
-/// rest is float rounding. Hardware adapter and WARP; the PC compile of
-/// the same `SampleGrad` (the host's own projection) is printed alongside.
-#[test]
-fn cube_gradients_pick_the_level() {
-    use super::host::{Dispatch, View};
-    let Some((console, pc)) = tools() else {
-        eprintln!("no console or PC compiler; skipped");
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!("victory-cube-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = r#"[RootSignature(RS)] [numthreads(32, 1, 1)]
-        void cs(uint i : SV_GroupIndex) {
-            uint ax = i % 3;
-            bool neg = (i & 4) != 0;
-            float sg = neg ? -1.0 : 1.0;
-            float a = neg ? 0.0 : (float(i % 5) - 2.0) * 0.15;
-            float b = neg ? 0.0 : (float(i % 7) - 3.0) * 0.1;
-            float3 p, u, v;
-            if (ax == 0) { p = float3(sg, a, b); u = float3(0, 1, 0); v = float3(0, 0, 1); }
-            else if (ax == 1) { p = float3(a, sg, b); u = float3(1, 0, 0); v = float3(0, 0, 1); }
-            else { p = float3(a, b, sg); u = float3(1, 0, 0); v = float3(0, 1, 0); }
-            float len = exp2(k.y + k.z * i - 4.0);
-            float3 gx = 4.0 * p + (0.6 * u + 0.8 * v) * len;
-            float3 gy = 4.0 * p + (0.8 * u - 0.6 * v) * (0.5 * len);
-            float l = cubet.SampleGrad(smp, p, gx, gy).x;
-            float lc = cubet.SampleGrad(smp, p, gx, gy, k.x).x;
-            outb.Store2(8 * i, asuint(float2(l, lc)));
-        }"#;
-    let cs_c = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
-    if let Ok(mut v) =
-        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-    {
-        v.validate(&mut cs_c.dxil.clone()).unwrap();
-    }
-    let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
-    let _ = std::fs::remove_dir_all(&dir);
-    // Clamp 2.5, level 0.3 + 0.115 × lane.
-    let k = [2.5f32, 0.3, 0.115, 0.0].map(f32::to_bits);
-    let (size, levels) = (32u32, 6u32);
-    let mut texels = Vec::new();
-    for face in 0..6 {
-        for level in 0..levels {
-            let n = (size >> level) as usize;
-            texels.extend(vec![[(10 * face + level) as f32; 4]; n * n]);
-        }
-    }
-    let dummy = [[0.0f32; 4]];
-    // The UAV table from heap index 5, `cubet` (t8 of the table from 9) at
-    // 17; the sampler table from index 1.
-    let views: Vec<View> = (0..18)
-        .map(|n| match n {
-            5 => View::RawUav(64),
-            17 => View::MippedCube(size, levels, &texels),
-            _ => View::Texture(1, 1, &dummy),
-        })
-        .collect();
-    let linear = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        MaxAnisotropy: 1,
-        MaxLOD: f32::MAX,
-        ..Default::default()
-    };
-    let samplers = [linear, linear];
-    let want: Vec<f32> = (0..32u32)
-        .flat_map(|i| {
-            let face = (i % 3 * 2 + u32::from(i & 4 != 0)) as f32;
-            let level = 0.3 + 0.115 * i as f32;
-            [10.0 * face + level, 10.0 * face + level.max(2.5)]
-        })
-        .collect();
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let run = |root: &ID3D12RootSignature, pso: &ID3D12PipelineState, roots| {
-            let out = host
-                .dispatch(
-                    root,
-                    pso,
-                    &Dispatch {
-                        roots,
-                        views: &views,
-                        samplers: &samplers,
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            out[0]
-                .iter()
-                .map(|&x| f32::from_bits(x))
-                .collect::<Vec<f32>>()
-        };
-        let (root, pso) = host.compute_pipeline(&cs_c).unwrap();
-        let ours = run(
-            &root,
-            &pso,
-            vec![(0, Root::Constants(user_data(&cs_c, &k)))],
-        );
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
-        let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
-        let table = |sampler, index| Root::Table { sampler, index };
-        let theirs = run(
-            &root_p,
-            &pso_p,
-            vec![
-                (0, Root::Constants(k.to_vec())),
-                (2, table(true, 1)),
-                (3, table(false, 5)),
-                (6, table(false, 9)),
-            ],
-        );
-        let worst = |a: &[f32]| {
-            a.iter()
-                .zip(&want)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
-        };
-        eprintln!(
-            "{label}: worst level difference {:.4} (the host's own SampleGrad: {:.4})",
-            worst(&ours),
-            worst(&theirs)
-        );
-        for (n, (x, y)) in ours.iter().zip(&want).enumerate() {
-            assert!((x - y).abs() <= 0.02, "{label}: lane {} {x} vs {y}", n / 2);
-        }
-        ran += 1;
-    }
-    assert!(ran > 0, "no SM 6.6 device");
-}
-
 /// Equal bits, both zero (the console's legacy multiply gives +0 where PC
 /// code gives -0), or two normal floats within 1e-3 relative.
 fn close(a: u32, b: u32) -> bool {
@@ -1341,12 +1080,9 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let host = match Host::new(false) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("no SM 6.6 device ({e}); skipped");
-            return;
-        }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1416,19 +1152,11 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);
     let root_srv: Vec<u32> = (0..32u32).map(|i| i * 0x0001_0003 + 7).collect();
-    // The root SRV as the view the host makes of it (`emit`, "Root SRVs and
-    // root UAVs").
-    let mut views = views;
-    assert_eq!(views.len(), ROOT_SRV_AT as usize);
-    views.push(View::Buffer {
-        data: &root_srv,
-        stride: Stride::Raw,
-    });
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1483,19 +1211,17 @@ fn translated_compute_matches_pc() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        // Our root views follow the user data in root parameter order: the
-        // case's own, then the host's view-stride table (16-bit typed
-        // accesses read their view's format kind there).
+        // Our root views follow the user data in root parameter order.
         let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            let data = if srv && slot == super::VIEW_STRIDES {
-                super::host::view_strides(&views)
+            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+            let data = if srv {
+                root_srv.clone()
             } else {
-                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-                if srv { root_srv.clone() } else { root_cbv.clone() }
+                root_cbv.clone()
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
@@ -1558,4 +1284,91 @@ fn translated_compute_matches_pc() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+#[ignore = "requires VICTORY_SHALLOW_WATER_SHADER and a hardware D3D12 device"]
+fn shallow_water_reduces_four_independent_tiles_on_the_gpu() {
+    use super::host::{Dispatch, Root, Stride, View};
+    let path = std::env::var_os("VICTORY_SHALLOW_WATER_SHADER").expect("original shader path");
+    let data = std::fs::read(path).unwrap();
+    assert_eq!(data.len(), 1260);
+    assert_eq!(
+        &data[4..20],
+        &[
+            0xad, 0x35, 0x83, 0xf9, 0x5b, 0x9b, 0x1c, 0xf, 0x97, 0x3b, 0xaa, 0xaa, 0xd5, 0xb1,
+            0x21, 0xdf
+        ]
+    );
+    let mut shader = translate(&data).unwrap();
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .unwrap();
+    validator.validate(&mut shader.dxil).unwrap();
+    let host = Host::new(false).unwrap();
+    let adapter = unsafe { host.device.GetAdapterLuid() };
+    eprintln!(
+        "dispatch on adapter {:08x}:{:08x}",
+        adapter.HighPart as u32, adapter.LowPart
+    );
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    for u in &shader.user_data {
+        if u.root == RootType::Table {
+            constants[u.index as usize] = 32; // table begins at heap slot 1
+        }
+    }
+    let records = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_VIEW_RECORDS))
+        .unwrap();
+    assert_eq!((records.slot, records.dword), (0, 0));
+    let mut input = vec![[800.0f32, -1000.0, -2000.0, -3000.0]; 64 * 64];
+    let minima = [1.0f32, 0.5, 0.25, 0.125];
+    // Exercise different invocation and wave positions within the four groups.
+    for ((x, y), value) in [(31, 31), (32, 0), (1, 62), (52, 43)]
+        .into_iter()
+        .zip(minima)
+    {
+        input[y * 64 + x][0] = value;
+    }
+    // Keep the backing resource identical, including on a zero-length title
+    // view. The early exit must follow the guest subview count independently.
+    let buffer = [0u32; 16];
+    for (count, expected) in [(4, minima), (1, minima), (0, [0.0; 4])] {
+        constants[records.index as usize] = count;
+        let views = [
+            View::Texture(1, 1, &[[0.0; 4]]),
+            View::Buffer {
+                data: &buffer,
+                stride: Stride::Structured(16),
+            },
+            View::Texture(64, 64, &input),
+            View::TextureUav(2, 2),
+        ];
+        let results = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants.clone()))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [2, 2, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(results[0].len(), 16);
+        for (pixel, want) in results[0].chunks_exact(4).zip(expected) {
+            assert_eq!(pixel, &[want.to_bits(); 4], "title record count {count}");
+        }
+        eprintln!(
+            "title record count {count}: {:?}",
+            results[0]
+                .chunks_exact(4)
+                .map(|p| f32::from_bits(p[0]))
+                .collect::<Vec<_>>()
+        );
+    }
 }

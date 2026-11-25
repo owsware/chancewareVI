@@ -17,47 +17,531 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level. `VICTORY_CAPTURE_WORLD`
-/// lists frames counted from the first one that ran 500 draws (the world's
-/// first, whose number depends on how fast the title loaded).
+/// too, and their draws traced at debug level. `VICTORY_CAPTURE_HEAVY_FRAMES`
+/// lists frames counted from the heavy scene's first ([`heavy_frame`]).
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
-        || WORLD
-            .get()
-            .is_some_and(|&w| world_offsets().iter().any(|&k| w + k == n))
+    let named = LIST
+        .get_or_init(|| {
+            let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
+            list.split(',')
+                .filter_map(|f| f.trim().parse().ok())
+                .collect()
+        })
+        .contains(&n);
+    // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
+    // one that ran 500 draws or more (a title's first 3D frames: their
+    // numbers depend on how long the menus were shown), and the 30th and
+    // the 80th (the title opens with a cutscene made in the
+    // engine: later shots of it, in case the first is dark by design).
+    //
+    // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
+    // from that first one (the title's blue patches show from
+    // about the 118th frame on, when the window's model has arrived and
+    // the reflections hold values: none of the four above has them).
+    static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let also = ALSO.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
+        list.split(',')
+            .filter_map(|f| f.trim().parse().ok())
+            .collect()
+    });
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let after = n.wrapping_sub(first);
+    named || REQUESTED_FRAME.load(std::sync::atomic::Ordering::Relaxed) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || heavy_listed(n)
 }
 
-fn numbers(var: &str) -> Vec<u64> {
-    let list = std::env::var(var).unwrap_or_default();
-    list.split(',')
-        .filter_map(|f| f.trim().parse().ok())
-        .collect()
-}
-
-fn world_offsets() -> &'static [u64] {
+/// `VICTORY_CAPTURE_HEAVY_FRAMES` (comma-separated): frames counted from
+/// the heavy scene's first, whose number differs from build to build.
+fn heavy_offsets() -> &'static [u64] {
     static OFFSETS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    OFFSETS.get_or_init(|| numbers("VICTORY_CAPTURE_WORLD"))
+    OFFSETS.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_HEAVY_FRAMES").unwrap_or_default();
+        list.split(',').filter_map(|f| f.trim().parse().ok()).collect()
+    })
 }
 
-/// The first frame that ran 500 draws on the host.
-static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// The heavy scene's first presented frame, once seen.
+#[derive(Debug, Default)]
+struct Heavy {
+    first: Option<u64>,
+}
 
-/// Frame `n` was presented: notes the world's first frame.
-pub(crate) fn presented(n: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let drawn = crate::draw::drawn();
-    let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
-    if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
-        let _ = WORLD.set(n);
-        tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+static HEAVY: std::sync::Mutex<Heavy> = std::sync::Mutex::new(Heavy { first: None });
+
+/// The title draws and mesh dispatches a frame records, run or dropped
+/// (`crate::draw::attempted`), that make it the heavy scene's first.
+const HEAVY_ATTEMPTS: u64 = 1_000;
+
+/// One presented frame against the heavy list: `attempts` is the title
+/// draws and mesh dispatches it recorded, whether they ran or were dropped
+/// (never compute dispatches: counted only when dropped, they made a
+/// compute-heavy frame heavy on one build and not on another, Sol's
+/// review), `state` the frames so far. Sets the scene's first frame when
+/// this one reaches [`HEAVY_ATTEMPTS`], and returns whether `n` is one of
+/// the listed frames after it.
+fn heavy_frame(n: u64, attempts: u64, state: &mut Heavy, offsets: &[u64]) -> bool {
+    if state.first.is_none() && attempts >= HEAVY_ATTEMPTS {
+        state.first = Some(n);
     }
+    state.first.is_some_and(|first| offsets.iter().any(|&k| first.saturating_add(k) == n))
+}
+
+/// Whether `n` is one of `VICTORY_CAPTURE_HEAVY_FRAMES` after the heavy
+/// scene's first frame; before that frame nothing is.
+fn heavy_listed(n: u64) -> bool {
+    let offsets = heavy_offsets();
+    !offsets.is_empty() && heavy_frame(n, 0, &mut HEAVY.lock().unwrap_or_else(|e| e.into_inner()), offsets)
+}
+
+/// With a capture folder, for the frames [`listed`]: `what` is added to
+/// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
+/// drop in the order recorded (the title records on several threads, so
+/// lines of different lists interleave; each names its list). The file
+/// says which pass writes which target, to find the pass whose output
+/// stays empty.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+    use std::io::Write;
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        // Before the world: the last lines are kept, and written out when
+        // it starts (`before-world-ops.txt`): what the title drew just
+        // before (the title shows a title card there, whose text
+        // did not show).
+        if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
+            // At most 300 lines of a frame: the world's first frame alone
+            // (thousands of operations, recorded before it is known to be
+            // the world's) pushed everything before it out.
+            static IN_FRAME: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+            {
+                let mut in_frame = IN_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+                if in_frame.0 != frame {
+                    *in_frame = (frame, 0);
+                }
+                in_frame.1 += 1;
+                if in_frame.1 > 300 {
+                    return;
+                }
+            }
+            let what = what();
+            let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.len() >= RING_LINES {
+                ring.pop_front();
+            }
+            ring.push_back(format!("frame {frame} list {list:#x} {what}"));
+        }
+        return;
+    }
+    let Some(folder) = folder() else {
+        return;
+    };
+    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
+    let what = what();
+    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if file.as_ref().is_none_or(|f| f.0 != frame) {
+        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+            return;
+        };
+        *file = Some((frame, 0, made));
+    }
+    if let Some((_, n, f)) = file.as_mut() {
+        *n += 1;
+        let _ = writeln!(f, "{n} list {list:#x} {what}");
+    }
+}
+
+/// The last lines of [`op`] before the world.
+#[cfg(feature = "diagnostics")]
+static RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+#[cfg(feature = "diagnostics")]
+const RING_LINES: usize = 6000;
+
+/// Whether `VICTORY_CAPTURE_WORLD` is set.
+fn world_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
+}
+
+/// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static REQUESTED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`: the draws run on the host so far.
+pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static REQUEST: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static LAST_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(path) = REQUEST.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_REQUEST").map(PathBuf::from))
+        && let Some(request) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        && request != 0 && request != LAST_REQUEST.swap(request, Relaxed)
+    {
+        REQUESTED_FRAME.store(frame + 1, Relaxed);
+        tracing::info!(frame = frame + 1, request, "requested material frame capture");
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempted = crate::draw::attempted();
+    let attempts = attempted.saturating_sub(LAST_ATTEMPTS.swap(attempted, Relaxed));
+    let offsets = heavy_offsets();
+    if !offsets.is_empty() {
+        let mut heavy = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+        let before = heavy.first;
+        heavy_frame(frame, attempts, &mut heavy, offsets);
+        if before.is_none() && heavy.first.is_some() {
+            tracing::info!(frame, attempts, "the heavy scene's first frame (VICTORY_CAPTURE_HEAVY_FRAMES counts from it)");
+        }
+    }
+    let before = LAST.swap(drawn, Relaxed);
+    if world_on()
+        && drawn.saturating_sub(before) >= 500
+        && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+    {
+        tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+        #[cfg(feature = "diagnostics")]
+        if let Some(folder) = folder() {
+            let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
+            let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
+"));
+        }
+    }
+}
+
+/// Whether the frame being recorded is listed and a folder is set: then
+/// indirect executions' records are read ([`read_indirect`]).
+pub(crate) fn recording_listed() -> bool {
+    folder().is_some() && listed(crate::queue::presented() + 1)
+}
+
+/// Where an indirect execution's records are.
+pub(crate) enum Records<'a> {
+    /// In the argument clamp's scratch buffer at an offset, in the
+    /// indirect-argument state (`crate::indirect::bound`).
+    Clamped(&'a ID3D12Resource, u64),
+    /// In a title buffer's host copy at an offset, whose state the host
+    /// does not name (buffers are promoted from COMMON on use).
+    Title(&'a ID3D12Resource, u64),
+}
+
+/// The work `records` of `kind` ask for, in `words` (`stride` bytes
+/// apart): how many ask for some, and how much in all. Draws: vertices
+/// (or indices) times instances; dispatches and mesh dispatches: groups.
+fn records_with_work(words: &[u32], kind: u32, stride: u32, records: usize) -> (usize, u64) {
+    let step = (stride as usize / 4).max(1);
+    let work = |r: usize| -> u64 {
+        let w = words.get(r * step..(r * step + step.min(3)).min(words.len())).unwrap_or(&[]);
+        match kind {
+            0 | 1 => u64::from(w.first().copied().unwrap_or(0)) * u64::from(w.get(1).copied().unwrap_or(1)),
+            _ => w.iter().take(3).map(|&x| u64::from(x)).product::<u64>() * u64::from(!w.is_empty()),
+        }
+    };
+    let busy = (0..records).filter(|&r| work(r) > 0).count();
+    (busy, (0..records).map(work).sum())
+}
+
+/// In a listed frame: copies an indirect execution's records and its count
+/// (a title buffer's copy and offset) to read-back memory, logged once the
+/// list has run, as our line logs it: "indirect kind K max M count C: B of
+/// R records with work, W in all; first [...] <pipeline>". An execution
+/// whose records ask for nothing draws nothing, which a dropped one does
+/// for another reason; the line tells the two apart.
+pub(crate) fn read_indirect(
+    list: &crate::host::HostList,
+    records: Records<'_>,
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, max): (u32, u32, u32),
+    name: String,
+) {
+    struct Readback(ID3D12Resource);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Readback {}
+    let Some(host) = crate::host::host() else { return };
+    let len = u64::from(stride) * u64::from(max.max(1));
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len + 4,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let mut buffer: Option<ID3D12Resource> = None;
+    let l = &list.list;
+    // SAFETY: plain creation; an open list. The clamp's scratch buffer goes
+    // from the indirect-argument state to copy source and back; a title
+    // buffer's copy is promoted to copy source by the copy itself.
+    unsafe {
+        if host
+            .device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+            .is_err()
+        {
+            return;
+        }
+        let Some(buffer) = buffer else { return };
+        match records {
+            Records::Clamped(scratch, at) => {
+                let (args, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                l.ResourceBarrier(&[crate::host::transition(scratch, args, copy)]);
+                l.CopyBufferRegion(&buffer, 0, scratch, at, len);
+                l.ResourceBarrier(&[crate::host::transition(scratch, copy, args)]);
+            }
+            Records::Title(copy, at) => l.CopyBufferRegion(&buffer, 0, copy, at, len),
+        }
+        if let Some((c, at)) = count {
+            l.CopyBufferRegion(&buffer, len, c, at, 4);
+        }
+        list.keep(&buffer);
+        let buffer = Readback(buffer);
+        let counted = count.is_some();
+        list.defer_after(move || {
+            let mut data = std::ptr::null_mut();
+            if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), (len as usize + 4) / 4);
+            let n = counted.then(|| words[len as usize / 4]);
+            let records = n.unwrap_or(max).min(max) as usize;
+            let (busy, total) = records_with_work(words, kind, stride, records);
+            let step = (stride as usize / 4).max(1);
+            let shown: Vec<&[u32]> = (0..records.min(4)).map(|r| &words[r * step..r * step + step.min(4)]).collect();
+            tracing::info!(
+                target: "victory_gpu::trace",
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name}"
+            );
+            buffer.0.Unmap(0, None);
+        });
+    }
+}
+
+/// `VICTORY_DUMP_AFTER=<hash>[,<hash>]`: in the frames [`listed`], with a
+/// capture folder, the textures a draw or dispatch of a pipeline with one
+/// of these shaders renders to or writes are saved straight after it, as
+/// the GPU leaves them there (the copies are in the same list, behind the
+/// draw): `frame-<n>-after-<hash>-<k>-<i>-<resource>-<w>x<h>-f<format>.png`,
+/// the `k`th such draw of the frame, its `i`th texture. What
+/// `VICTORY_DUMP_TARGETS` saves is each texture at the frame's end, after
+/// every pass that writes it.
+fn dump_after_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        let list = std::env::var("VICTORY_DUMP_AFTER").unwrap_or_default();
+        list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+    })
+}
+
+/// `VICTORY_DUMP_INPUT=<compute hash>:s<table>+<dword offset>,...`.
+/// Capture one explicitly bound 2D SRV per named direct dispatch on listed frames.
+/// Use the same hash in VICTORY_DUMP_AFTER to capture outputs of that invocation.
+#[derive(Debug, PartialEq)]
+pub(crate) struct InputSelector {
+    pub hash: String,
+    pub table: u8,
+    pub dword: u32,
+}
+
+fn input_selector(value: &str) -> Option<InputSelector> {
+    let (hash, binding) = value.trim().split_once(":s")?;
+    let (table, dword) = binding.split_once('+')?;
+    if hash.len() != 16 || !hash.bytes().all(|v| v.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(InputSelector {
+        hash: hash.to_ascii_lowercase(),
+        table: table.parse().ok()?,
+        dword: dword.parse().ok()?,
+    })
+}
+
+pub(crate) fn input_selectors() -> &'static [InputSelector] {
+    static SELECTORS: std::sync::OnceLock<Vec<InputSelector>> = std::sync::OnceLock::new();
+    SELECTORS.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_INPUT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(input_selector)
+            .collect()
+    })
+}
+
+pub(crate) struct InputDump {
+    frame: u64,
+    selector: &'static InputSelector,
+    resource: usize,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
+pub(crate) fn read_input(
+    list: &crate::host::HostList,
+    frame: u64,
+    selector: &'static InputSelector,
+    resource: usize,
+) -> Option<InputDump> {
+    let host = crate::host::host()?;
+    let copy = crate::resource::host_copy(resource as crate::object::This)?;
+    // SAFETY: the Arc owns the live source. Only a single-slice 2D image is supported.
+    let desc = unsafe { copy.texture.GetDesc() };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 {
+        return None;
+    }
+    let (buffer, footprint) = list.read_bound_input(&host.device, &copy)?;
+    list.keep(&buffer);
+    Some(InputDump { frame, selector, resource, buffer, footprint })
+}
+
+/// The textures the unordered access views of the draw or dispatch being
+/// bound write, by host list: what [`dump_after`] saves besides render
+/// targets.
+static WRITTEN: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// A draw or dispatch being bound on `list` writes `resource` through an
+/// unordered access view.
+pub(crate) fn note_written(list: usize, resource: crate::object::This) {
+    if !dump_after_hashes().is_empty() && recording_listed() {
+        WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).push((list, resource as usize));
+    }
+}
+
+/// The hash of `hashes` that `shaders` (a pipeline's, as
+/// `crate::pipeline::shaders_of` gives them) has, if any.
+fn named_after<'a>(hashes: &'a [String], shaders: &str) -> Option<&'a String> {
+    let shaders = shaders.to_ascii_lowercase();
+    hashes.iter().find(|h| shaders.contains(h.as_str()))
+}
+
+/// Which draw of `hash`'s pipeline this is in `frame`, from 0: `seen`
+/// holds this frame's counts (and forgets those of earlier frames).
+fn nth_after(seen: &mut Vec<(u64, String, u32)>, frame: u64, hash: &str) -> u32 {
+    seen.retain(|s| s.0 == frame);
+    match seen.iter_mut().find(|s| s.1 == hash) {
+        Some(s) => {
+            s.2 += 1;
+            s.2
+        }
+        None => {
+            seen.push((frame, hash.to_owned(), 0));
+            0
+        }
+    }
+}
+
+/// Straight after a draw or dispatch of `pipeline` on `list` (see
+/// [`dump_after_hashes`]): `targets` (render targets and depth) and the
+/// textures it writes through unordered access are copied out in the list
+/// and saved once the list has run.
+pub(crate) fn dump_after(list: &crate::host::HostList, pipeline: crate::object::This, targets: &[usize]) {
+    dump_with_input(list, pipeline, targets, None);
+}
+
+pub(crate) fn dump_with_input(
+    list: &crate::host::HostList,
+    pipeline: crate::object::This,
+    targets: &[usize],
+    input: Option<InputDump>,
+) {
+    let hashes = dump_after_hashes();
+    if hashes.is_empty() && input.is_none() {
+        return;
+    }
+    let key = std::ptr::from_ref(list) as usize;
+    let mut textures: Vec<usize> = targets.iter().copied().filter(|&t| t != 0).collect();
+    WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(l, r)| {
+        if l == key && !textures.contains(&r) {
+            textures.push(r);
+        }
+        l != key
+    });
+    if input.is_none() && !recording_listed() {
+        return;
+    }
+    let after = named_after(hashes, &crate::pipeline::shaders_of(pipeline));
+    let Some(hash) = after.or_else(|| input.as_ref().map(|i| &i.selector.hash)) else {
+        return;
+    };
+    let frame = input.as_ref().map_or_else(|| crate::queue::presented() + 1, |i| i.frame);
+    static SEEN: std::sync::Mutex<Vec<(u64, String, u32)>> = std::sync::Mutex::new(Vec::new());
+    let k = nth_after(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), frame, hash);
+    if let Some(i) = input {
+        let f = i.footprint.Footprint;
+        let name = format!(
+            "frame-{frame}-before-{hash}-{k}-s{}+{}-{:#x}-{}x{}-f{}",
+            i.selector.table, i.selector.dword, i.resource, f.Width, f.Height, f.Format.0,
+        );
+        defer_texture_png(list, i.buffer, i.footprint, name);
+    }
+    if after.is_none() {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    for (i, &resource) in textures.iter().enumerate() {
+        let Some(copy) = crate::resource::host_copy(resource as crate::object::This) else { continue };
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            continue;
+        }
+        // In the list's own account of the texture's state: the next draw
+        // that uses it moves it back.
+        crate::list::ensure_state(list, resource as crate::object::This, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let Some((buffer, footprint)) = read_back(&host.device, &list.list, &copy.texture) else { continue };
+        list.keep(&buffer);
+        let name = format!("frame-{frame}-after-{hash}-{k}-{i:02}-{resource:#x}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        defer_texture_png(list, buffer, footprint, name);
+    }
+}
+
+fn defer_texture_png(
+    list: &crate::host::HostList,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    name: String,
+) {
+    struct Readback(ID3D12Resource);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Readback {}
+    let buffer = Readback(buffer);
+    list.defer_after(move || {
+        let f = footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the list has run; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+            let pitch = f.RowPitch as usize;
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+            match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+                Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
+                None => tracing::info!(format = f.Format.0, name, "texture not dumped: format"),
+            }
+            buffer.0.Unmap(0, None);
+        }
+    });
 }
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    // Two frames in a row each time: the title draws to two buffers in turn,
+    // and every 8th or 16th frame alone only ever showed one of them.
+    // Before the world, with `VICTORY_CAPTURE_WORLD` and
+    // `VICTORY_CAPTURE_MENUS=1`: every 16th frame too (small pictures of
+    // menus, loading screens and title cards). Asked for apart: saving them
+    // makes the menus and their music stutter.
+    static MENUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let menus = *MENUS.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_MENUS").is_some_and(|v| v == "1"));
+    let before_world = menus && world_on() && n % 16 < 2 && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // In the world: every 8th frame's picture, a timeline of the opening
+    // cutscene (its shots do not fall on the same frame numbers from run to
+    // run, so single frames cannot be compared between runs).
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first) % 8 < 2;
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -89,14 +573,13 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+    match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -129,6 +612,17 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    read_back_of(device, list, texture, 0)
+}
+
+/// As [`read_back`], of subresource `sub` (the stencil plane of a
+/// one-level, one-slice depth-stencil texture is subresource 1).
+fn read_back_of(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    sub: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -136,7 +630,7 @@ pub(crate) fn read_back(
         let desc = texture.GetDesc();
         device.GetCopyableFootprints(
             &desc,
-            0,
+            sub,
             1,
             0,
             Some(&mut footprint),
@@ -187,7 +681,7 @@ pub(crate) fn read_back(
             pResource: std::mem::transmute_copy(texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: sub,
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
@@ -231,286 +725,42 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
-/// Each with the first pipeline that wrote it as an unordered-access view
-/// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
-/// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
-/// a pipeline with one of them writes, the first frame it runs.
-#[allow(clippy::type_complexity)]
-static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
-> = std::sync::Mutex::new(Vec::new());
+static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
 
-thread_local! {
-    /// The pipeline whose draw or dispatch this thread is binding.
-    static WRITER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-/// Names the pipeline whose views this thread binds next (empty: none).
-pub(crate) fn binding(pipeline: &str) {
-    if dump_on() {
-        WRITER.with(|w| pipeline.clone_into(&mut w.borrow_mut()));
-    }
-}
-
-pub(crate) fn dump_on() -> bool {
+fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
+    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
-/// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
-static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
-
-/// Buffers such a pipeline writes: title memory, its bytes when first
-/// bound in the frame, the pipeline. Logged at the present: dwords changed
-/// and dwords not zero.
-#[allow(clippy::type_complexity)]
-static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mutex::new(Vec::new());
-
-/// Notes a title texture the frame being built renders to or writes (by a
-/// command of `list`, whose submission dumps it again when the frame is
-/// listed).
-pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
-    if resource.is_null() || !dump_on() {
+/// Notes a title texture the frame being built renders to or writes.
+pub(crate) fn note_target(resource: crate::object::This) {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
-    let by = WRITER.with(|w| w.borrow().clone());
-    // Lists are recorded ahead of the frame that submits them.
-    list.note_target(resource as usize, &by);
-    if !listed(crate::queue::presented() + 1) {
-        let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
-        let writers = writers.get_or_insert_with(|| {
-            let list = std::env::var("VICTORY_DUMP_WRITERS").unwrap_or_default();
-            list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
-        });
-        if by.is_empty() || !writers.iter().any(|h| by.contains(h.as_str())) {
-            return;
-        }
-        if let Some((at, len)) = crate::resource::buffer_bytes(resource) {
-            let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
-            if !buffers.iter().any(|b| b.0 == at as usize) {
-                let mut before = vec![0u8; (len as usize).min(64 << 20) & !3];
-                if crate::host::read_into(at, &mut before) {
-                    buffers.push((at as usize, before, by));
-                }
-            }
-            return;
-        }
-    }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
+    if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy, by));
+        targets.push((resource as usize, copy));
     }
-}
-
-/// Whether textures wait to be dumped at this present.
-pub(crate) fn has_targets() -> bool {
-    !TARGETS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-        || !BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
-    // Writers dumped once.
-    if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        writers.retain(|h| {
-            !targets.iter().any(|t| t.2.contains(h.as_str()))
-                && !buffers.iter().any(|b| b.2.contains(h.as_str()))
-        });
-    }
-    for (at, before, by) in &buffers {
-        let mut after = vec![0u8; before.len()];
-        if !crate::host::read_into(*at as *const u8, &mut after) {
-            continue;
-        }
-        let dwords = |b: &[u8]| -> Vec<u32> {
-            b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect()
-        };
-        let (old, new) = (dwords(before), dwords(&after));
-        let changed = old.iter().zip(&new).filter(|(a, b)| a != b).count();
-        let set = new.iter().filter(|&&x| x != 0).count();
-        tracing::info!(
-            frame,
-            buffer = format_args!("{at:#x}"),
-            dwords = new.len(),
-            changed,
-            set,
-            by = by.as_str(),
-            "a buffer the named pipeline writes, at the present"
-        );
-    }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy, by)) in targets.iter().enumerate() {
+    for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
-    }
-}
-
-/// After submission `sub` of a listed frame has run: the textures its lists
-/// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
-/// then, to follow a frame pass by pass).
-pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let Some(host) = crate::host::host() else { return };
-    let frame = crate::queue::presented() + 1;
-    peek(&format!("frame-{frame}-s{sub:04}"));
-    for (i, (resource, by)) in targets.iter().enumerate() {
-        let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
-            continue;
-        };
-        let texture = &copy.texture;
-        // SAFETY: a live resource.
-        let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
-            continue;
-        }
-        let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
-        // A depth texture's writable twin (`crate::twin`): what unordered
-        // views wrote, which reaches the depth texture at its next use.
-        for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
-            // SAFETY: a live resource.
-            let pd = unsafe { plane.texture.GetDesc() };
-            let by = format!("{by}-twin{p}");
-            let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
-        }
-    }
-}
-
-/// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
-/// default): those bytes of title memory, as dwords and floats, after each
-/// submission of a listed frame.
-fn peek(when: &str) {
-    static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
-    let list = LIST.get_or_init(|| {
-        std::env::var("VICTORY_PEEK")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|e| {
-                let (a, n) = e.split_once(':').unwrap_or((e, "16"));
-                let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
-                Some((a, n.trim().parse().ok()?))
-            })
-            .collect()
-    });
-    for &(at, len) in list {
-        let mut bytes = vec![0u8; len.min(256)];
-        if !crate::host::read_into(at as *const u8, &mut bytes) {
-            continue;
-        }
-        let words: Vec<String> = bytes
-            .chunks(4)
-            .map(|c| {
-                let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
-                format!("{w:#x}={}", f32::from_bits(w))
-            })
-            .collect();
-        tracing::info!("peek {when} {at:#x}: {}", words.join(" "));
-    }
-}
-
-/// In a listed frame: copies an indirect execution's records (`args`: the
-/// list's argument buffer and offset, in the indirect-argument state) and
-/// its count (a title buffer's copy) to readback memory,
-/// logged once the list has run: how many records ask for work, and the
-/// first ones.
-pub(crate) fn read_indirect(
-    list: &crate::host::HostList,
-    args: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    (kind, stride, max): (u32, u32, u32),
-    name: String,
-    always: bool,
-) {
-    struct Readback(ID3D12Resource);
-    // SAFETY: D3D12 objects are free-threaded.
-    unsafe impl Send for Readback {}
-    // SAFETY: as above.
-    unsafe impl Sync for Readback {}
-    let Some(host) = crate::host::host() else { return };
-    let len = u64::from(stride) * u64::from(max.max(1));
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: len + 4,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-    let mut buffer: Option<ID3D12Resource> = None;
-    let l = &list.list;
-    use crate::host::transition;
-    let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    // SAFETY: plain creation; an open list and live buffers in the states
-    // named, put back after the copies.
-    unsafe {
-        if host
-            .device
-            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
-            .is_err()
-        {
-            return;
-        }
-        let Some(buffer) = buffer else { return };
-        l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
-        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
-        if let Some((c, at)) = count {
-            // A title buffer's copy: never transitioned, the read promotes it.
-            l.CopyBufferRegion(&buffer, len, c, at, 4);
-        }
-        l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
-        list.keep(&buffer);
-        let buffer = Readback(buffer);
-        let counted = count.is_some();
-        list.defer_after(move || {
-            // Recorded ahead: logged if the frame running it is listed.
-            let frame = crate::queue::presented() + 1;
-            if !always && !listed(frame) {
-                return;
-            }
-            let mut data = std::ptr::null_mut();
-            if buffer.0.Map(0, None, Some(&mut data)).is_err() {
-                return;
-            }
-            let words = std::slice::from_raw_parts(data.cast::<u32>(), (len as usize + 4) / 4);
-            let n = counted.then(|| words[len as usize / 4]);
-            let records = n.unwrap_or(max).min(max) as usize;
-            let step = stride as usize / 4;
-            let first = |r: usize| &words[r * step..r * step + step.min(4)];
-            // Draws: vertices (or indices) × instances; dispatches: groups.
-            let work = |r: usize| -> u64 {
-                let w = first(r);
-                match kind {
-                    0 | 1 => u64::from(w[0]) * u64::from(w.get(1).copied().unwrap_or(1)),
-                    _ => w.iter().take(3).map(|&x| u64::from(x)).product(),
-                }
-            };
-            let busy = (0..records).filter(|&r| work(r) > 0).count();
-            let total: u64 = (0..records).map(work).sum();
-            let shown: Vec<&[u32]> = (0..records.min(4)).map(first).collect();
-            tracing::info!(
-                target: "victory_gpu::trace",
-                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name} frame {frame}"
-            );
-            buffer.0.Unmap(0, None);
-        });
+        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
 }
 
@@ -518,8 +768,9 @@ fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
-    prefix: &str,
-    (i, resource, by): (usize, crate::object::This, &str),
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
@@ -532,14 +783,27 @@ fn dump_one(
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
         let read = read_back(&host.device, &list.list, texture);
+        // The stencil plane of a depth-stencil target, which the title's
+        // lighting reads (material class in the low bits; 0x08 "inside a
+        // room", which the lamps of a room are multiplied by): the plane
+        // after the depth plane of a one-level, one-slice texture.
+        let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
+            && d.MipLevels == 1
+            && d.DepthOrArraySize == 1)
+            .then(|| read_back_of(&host.device, &list.list, texture, 1))
+            .flatten();
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
         }
-        read
+        (read, stencil)
     };
+    let (read, stencil) = read;
     list.close();
     host.execute(&[&list]);
+    if let Some((buffer, footprint)) = stencil {
+        stencil_values(&buffer, &footprint, frame, resource);
+    }
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
@@ -550,40 +814,96 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        // Tiny targets (exposure, averages): their values as they are.
-        if f.Width * f.Height <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
-            let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
-                .map(|c| {
-                    let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
-                    format!("{w:#x}={}", f32::from_bits(w))
-                })
-                .collect();
-            tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
+        // A 24-bit depth plane comes back as 32-bit words: which depth values
+        // (low 24 bits) and which top bytes it holds, the most common first.
+        if matches!(d.Format.0, 44..=47) {
+            let mut depths = std::collections::HashMap::<u32, u32>::new();
+            let mut tops = std::collections::HashMap::<u32, u32>::new();
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let at = y * pitch + x * 4;
+                    let w = u32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4]));
+                    *depths.entry(w & 0xff_ffff).or_default() += 1;
+                    *tops.entry(w >> 24).or_default() += 1;
+                }
+            }
+            let most = |m: std::collections::HashMap<u32, u32>| {
+                let mut v: Vec<(u32, u32)> = m.into_iter().collect();
+                v.sort_by_key(|e| std::cmp::Reverse(e.1));
+                (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
+            };
+            tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
-        // decode it as depth, not as floats (all denormals, shown black).
-        let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
-        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let mut name = format!(
-                "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
+        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+            let name = format!(
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            // The pipeline's hashes (its name is "[stage hash, ...]").
-            let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
-            if !by.is_empty() {
-                name.push_str("-by-");
-                name.push_str(&by);
-            }
-            // Whether anything but zeros is there (a dump is normalized).
-            if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
-                name.push_str("-black");
-            }
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
+        buffer.Unmap(0, None);
+    }
+}
+
+/// Logs which values a stencil plane read back by [`read_back_of`] holds
+/// (the most common first), how many texels have each of its bits, and the
+/// box of the texels with bit 3 (0x08).
+fn stencil_values(
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    frame: u64,
+    resource: crate::object::This,
+) {
+    let f = footprint.Footprint;
+    let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows of
+    // one byte a texel, the last row without its padding.
+    unsafe {
+        if h == 0 || w == 0 || buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
+        let mut values = [0u32; 256];
+        let mut bits = [0u32; 8];
+        // Left, top, right, bottom of the texels with bit 3.
+        let mut inside = [u32::MAX, u32::MAX, 0, 0];
+        for y in 0..h {
+            for (x, &v) in rows[y * pitch..y * pitch + w].iter().enumerate() {
+                values[usize::from(v)] += 1;
+                for (bit, count) in bits.iter_mut().enumerate() {
+                    *count += u32::from(v >> bit & 1);
+                }
+                if v & 8 != 0 {
+                    inside = [
+                        inside[0].min(x as u32),
+                        inside[1].min(y as u32),
+                        inside[2].max(x as u32),
+                        inside[3].max(y as u32),
+                    ];
+                }
+            }
+        }
+        let mut most: Vec<(usize, u32)> = values
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|v| v.1 != 0)
+            .collect();
+        most.sort_by_key(|v| std::cmp::Reverse(v.1));
+        most.truncate(16);
+        tracing::info!(
+            frame,
+            ?resource,
+            width = w,
+            height = h,
+            values = ?most,
+            texels_with_bit = ?bits,
+            bit3_box = ?inside,
+            "stencil plane values (value, texels)"
+        );
         buffer.Unmap(0, None);
     }
 }
@@ -622,20 +942,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
-            // The PNG drops alpha: its range and how many texels have each
-            // channel zero are logged.
-            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
-                    for c in 0..4 {
-                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
-                        zero[c] += usize::from(p[c] == 0);
-                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
-            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -680,35 +992,96 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, max) = if grey {
+    let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
     } else {
         (0.0, finite.fold(0.0f32, f32::max))
     };
-    // Colour scaled by the 99th percentile of the non-zero values, so a few
-    // hot pixels do not hide the rest; how many are not zero, and the median.
-    let mut set: Vec<f32> = values
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|v| v.is_finite() && *v != 0.0)
-        .map(f32::abs)
-        .collect();
-    let nonzero = set.len() as f64 / (values.len() * 3).max(1) as f64;
-    let mut at = |q: f64| -> f32 {
-        if set.is_empty() {
-            return 0.0;
-        }
-        let k = ((set.len() - 1) as f64 * q).round() as usize;
-        *set.select_nth_unstable_by(k, f32::total_cmp).1
-    };
-    let (p50, p99) = (at(0.5), at(0.99));
-    let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
-    let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    // How much of the target holds anything: a lit scene and one bright
+    // lamp on black have the same highest value.
+    let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
+    let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
+    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Small float colour targets (the 1x1 luminance and exposure targets):
+    // every texel's four channels as numbers. The picture has no alpha and
+    // eight bits a channel.
+    if matches!(format, 1..=2 | 9..=10) && w * h <= 16 {
+        for y in 0..h {
+            for x in 0..w {
+                let b = px(x, y, n);
+                let texel: [f32; 4] = if n == 16 {
+                    [0, 1, 2, 3].map(|i| f32::from_bits(u32_at(b, i)))
+                } else {
+                    [0, 1, 2, 3].map(|i| half(u16_at(b, i)))
+                };
+                tracing::info!(format, x, y, ?texel, "target texel");
+            }
+        }
+    }
+    // R32_UINT targets hold packed light (the title reads them back as
+    // R9G9B9E5): as floats their low, high and share above the lowest say
+    // nothing. How many texels hold any bit, and the highest channel value
+    // of the packed reading.
+    if format == 42 {
+        let (mut set, mut packed_high) = (0usize, 0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let v = u32_at(px(x, y, 4), 0);
+                set += usize::from(v != 0);
+                let scale = 2f32.powi((v >> 27) as i32 - 24);
+                for k in 0..3 {
+                    packed_high = packed_high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
+                }
+            }
+        }
+        let nonzero_bits_percent = set as f32 * 100.0 / (w * h).max(1) as f32;
+        tracing::info!(format, nonzero_bits_percent, packed_high, "target values as packed light");
+        // The same words as plain numbers, by class. Tables of indices and
+        // masks say nothing as floats or as packed light: in the title's
+        // shadow-mask table 0 is a block in full shadow, a word up to 255
+        // one value for the block, above that a block of the atlas, and all
+        // ones a texel never written.
+        let mut classes = [0usize; 6];
+        let mut highest_below_ones = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let v = u32_at(px(x, y, 4), 0);
+                classes[match v {
+                    0 => 0,
+                    1..=15 => 1,
+                    16..=255 => 2,
+                    256..=0x00ff_ffff => 3,
+                    u32::MAX => 5,
+                    _ => 4,
+                }] += 1;
+                if v != u32::MAX {
+                    highest_below_ones = highest_below_ones.max(v);
+                }
+            }
+        }
+        tracing::info!(
+            format,
+            width = w,
+            height = h,
+            zero = classes[0],
+            one_to_15 = classes[1],
+            to_255 = classes[2],
+            to_24_bits = classes[3],
+            larger = classes[4],
+            all_ones = classes[5],
+            highest_below_ones,
+            "target values as words"
+        );
+    }
+    // Float colours (scene light) go through a cube root: scaled linearly,
+    // a night scene under one lamp of 50 units came out all black.
+    let curved = matches!(format, 1..=2 | 9..=10 | 26);
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| {
+            let t = ((c - low) / range).clamp(0.0, 1.0);
+            ((if curved { t.cbrt() } else { t }) * 255.0) as u8
+        });
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -749,29 +1122,20 @@ pub(crate) fn probe(
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
-    // One buffer for every present: each is waited for before the next
-    // (made and released per present, it cost a kernel call per frame).
-    static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    let buffer = BUFFER
-        .get_or_init(|| {
-            let mut buffer: Option<ID3D12Resource> = None;
-            // SAFETY: plain creation.
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    None,
-                    &mut buffer,
-                )
-            }
-            .ok()?;
-            buffer
-        })
-        .clone()?;
-    // SAFETY: an open list; locations naming live resources.
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; an open list; locations naming live resources.
     unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
@@ -851,6 +1215,107 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_input_selector_requires_an_exact_shader_and_table_binding() {
+        let input = super::input_selector("DF11DCD012CD7382:s1+56").unwrap();
+        assert_eq!((input.hash.as_str(), input.table, input.dword), ("df11dcd012cd7382", 1, 56));
+        for bad in ["df11:s1+56", "df11dcd012cd7382:s256+56", "df11dcd012cd7382:s1-56", "wrong"] {
+            assert!(super::input_selector(bad).is_none());
+        }
+    }
+
+    /// `VICTORY_DUMP_AFTER` names pipelines by any of their shaders' hashes
+    /// (in either case), and numbers each one's draws from 0 in a frame.
+    #[test]
+    fn dump_after_names_a_pipeline_by_a_shader_and_counts_its_draws() {
+        let hashes = ["ce3f0432a08f1d35".to_owned(), "a1bf269d5b19f025".to_owned()];
+        let shaders = "[mesh F5E50EB2108C425B, pixel CE3F0432A08F1D35]";
+        assert_eq!(super::named_after(&hashes, shaders).map(String::as_str), Some("ce3f0432a08f1d35"));
+        assert_eq!(super::named_after(&hashes, "[compute 02384a60fda6f2d0]"), None);
+        assert_eq!(super::named_after(&hashes, "no pipeline"), None);
+        let mut seen = Vec::new();
+        assert_eq!(super::nth_after(&mut seen, 7, "a"), 0);
+        assert_eq!(super::nth_after(&mut seen, 7, "b"), 0);
+        assert_eq!(super::nth_after(&mut seen, 7, "a"), 1);
+        assert_eq!(super::nth_after(&mut seen, 8, "a"), 0, "a new frame counts afresh");
+        assert_eq!(seen.len(), 1);
+    }
+
+    /// The records an indirect execution logs as having work: a draw's
+    /// vertices times instances, a dispatch's or mesh dispatch's groups,
+    /// only as many records as the count allows.
+    #[test]
+    fn records_with_work_count_what_each_kind_asks_for() {
+        // Draws (vertices, instances, first vertex, first instance), 16 bytes.
+        let draws = [3, 2, 0, 0, 0, 5, 0, 0, 4, 1, 0, 0];
+        assert_eq!(super::records_with_work(&draws, 0, 16, 3), (2, 10), "6 and 4, and one of no vertices");
+        assert_eq!(super::records_with_work(&draws, 0, 16, 1), (1, 6), "a count of one");
+        // Mesh dispatches (x, y, z), 12 bytes: an empty one and two of work.
+        let meshes = [2, 1, 1, 0, 1, 1, 8, 2, 1];
+        assert_eq!(super::records_with_work(&meshes, 10, 12, 3), (2, 18));
+        assert_eq!(super::records_with_work(&meshes, 10, 12, 0), (0, 0), "a count of zero");
+    }
+
+    /// The reader records its copies into a real list, which runs, and its
+    /// line is made once the list has run (a title buffer's copy, as for a
+    /// dropped execution: no barrier of ours on it).
+    #[test]
+    fn read_indirect_copies_records_and_count_into_a_list_that_runs() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: inside the mapping: two mesh records and a count.
+        unsafe { (data as *mut [u32; 7]).write([2, 1, 1, 0, 1, 1, 1]) };
+        let list = host.new_list().unwrap();
+        super::read_indirect(&list, super::Records::Title(&buffer, 0), Some((&buffer, 24)), (10, 12, 2), "test".to_owned());
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A title draw or mesh dispatch counts for the heavy scene's detector
+    /// whether it runs or is dropped, and a compute dispatch never: here
+    /// all are dropped (no pipeline). Before, the detector took draws run
+    /// plus drops, so a dropped compute dispatch counted and a run one did
+    /// not (Sol's review).
+    #[test]
+    fn draw_attempts_count_title_draws_run_or_not_and_no_dispatches() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let before = crate::draw::attempted();
+        state.draw(&list, 3, 1, 0, 0);
+        state.draw_indexed(&list, 3, 1, 0, 0, 0);
+        state.dispatch_mesh(&list, 1);
+        assert_eq!(crate::draw::attempted() - before, 3, "a draw, an indexed draw and a mesh dispatch, all dropped");
+        state.dispatch(&list, 1, 1, 1, None);
+        assert_eq!(crate::draw::attempted() - before, 3, "a compute dispatch, dropped, is not one");
+        list.close();
+    }
+
+    /// `VICTORY_CAPTURE_HEAVY_FRAMES` counts presented frames from the first
+    /// frame that recorded 1,000 title draws and mesh dispatches, run or
+    /// dropped. A light frame later does not move that start.
+    #[test]
+    fn heavy_frames_count_from_the_first_heavy_one() {
+        let offsets = [2, 5];
+        let mut state = super::Heavy::default();
+        assert!(!super::heavy_frame(10, 999, &mut state, &offsets), "999 attempts: not heavy");
+        assert_eq!(state.first, None);
+        // 1,000: the scene starts here; the list counts from the frame after.
+        assert!(!super::heavy_frame(11, 1_000, &mut state, &offsets));
+        assert_eq!(state.first, Some(11));
+        for (n, listed) in [(12, false), (13, true), (14, false), (15, false), (16, true), (17, false)] {
+            assert_eq!(super::heavy_frame(n, 0, &mut state, &offsets), listed, "{n}");
+        }
+        assert!(!super::heavy_frame(40, 10, &mut state, &offsets), "a later light frame");
+        assert_eq!(state.first, Some(11));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

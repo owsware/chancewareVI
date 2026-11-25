@@ -1,18 +1,31 @@
 [package]
 name = "victory"
-description = "Command-line front end: inspect, census, convert, run."
+default-run = "chanceware"
+autobins = false
+description = "Chanceware command-line runtime for Windows."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "chanceware"
+path = "src/main.rs"
+
+[[bin]]
+name = "chanceware-play"
+path = "src/bin/victory-play.rs"
+
+[[bin]]
+name = "chanceware-warm"
+path = "src/bin/victory-warm.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
-victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true

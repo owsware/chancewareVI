@@ -84,6 +84,24 @@ mod tests {
         );
     }
 
+    /// A title's own end of the process resolves to our logging export,
+    /// never to the host's silent `ExitProcess`.
+    #[test]
+    fn exit_process_resolves_to_hle() {
+        let r = HleResolver::new(HostPolicy::default());
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                r.classify(dll, &name("ExitProcess")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+        }
+    }
+
     #[test]
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
@@ -118,32 +136,5 @@ mod tests {
                 &name("GetModuleHandleW")
             ),
             Some(Provenance::Hle)
-        );
-    }
-
-    // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
-    // outside the host policy (its own `ws2_32` imports would be a network
-    // path `modules::net` never sees).
-    #[test]
-    fn the_rpc_runtime_is_implemented_here() {
-        let r = HleResolver::new(HostPolicy::none());
-        for call in [
-            "UuidCreate",
-            "UuidCreateSequential",
-            "UuidFromStringA",
-            "UuidFromStringW",
-            "UuidToStringA",
-            "UuidToStringW",
-            "RpcStringFreeA",
-            "RpcStringFreeW",
-        ] {
-            assert_eq!(
-                r.classify("rpcrt4.dll", &name(call)),
-                Some(Provenance::Hle),
-                "{call}"
-            );
-        }
-        // A call we do not implement is not passed to the host either.
-        assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
-    }
+        );    }
 }

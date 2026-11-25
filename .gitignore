@@ -2,17 +2,34 @@
 # RULE #1: nothing from the game (or any other proprietary source) is ever
 # committed.
 # Everything is built from files the user supplies at runtime.
-# This file is the first line of defence; `cargo xtask policy` (also run by
-# the pre-commit hook in .githooks/) is the second and is authoritative.
-# See docs/asset-policy.md.
+# Ignore rules and `cargo xtask policy` help prevent accidental commits.
+# They do not protect tracked files, history, or force-added content.
+# See the asset policy in README.md.
 # ---------------------------------------------------------------------------
 
 # Build output
 /target/
 /tests/fixtures/*/target/
 
+# Keep local notes out of new commits. Existing tracked notes are excluded
+# from source exports by .gitattributes; ignore rules do not untrack them.
+*.md
+!/README.md
+!/AGENTS.md
+
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+/game-path.txt
+/state/
+/.local/
+/.secrets/
+.env
+.env.*
+.netrc
+*.pem
+*.key
+*.pfx
+*.p12
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/
@@ -24,6 +41,25 @@
 /extracted/
 /cache/
 /out/
+/logs/
+/captures/
+/refused-shaders/
+/graphify-out/
+
+# Local diagnostics, GPU captures, and analysis databases
+*.log
+*.dmp
+*.mdmp
+*.etl
+*.rdc
+*.wpix
+*.idb
+*.i64
+*.id[012]
+*.nam
+*.til
+*.gpr
+*.rep/
 
 # Executables, libraries, symbols
 *.exe
@@ -45,14 +81,19 @@
 
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
-# The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/crates/victory-formats/src/bcpack-tables.bin
+# A local copy of the separately supplied BCPack tables stays ignored.
 *.dat
 *.pak
 *.rpf
 *.dds
 *.ktx
 *.ktx2
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
 *.dxbc
 *.dxil
 *.cso
@@ -69,6 +110,9 @@
 *.zip
 *.7z
 *.rar
+*.tar
+*.tgz
+*.gz
 
 # Editor / OS noise
 .vs/

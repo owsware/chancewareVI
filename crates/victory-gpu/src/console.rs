@@ -17,20 +17,12 @@ impl Console {
     /// advanced configuration; Series S has one range, counted as standard
     /// (7,776 MiB, the published console-mode figure).
     // shortcut: later system updates gave Series S titles more (amount not
-    // published here); Grand Theft Auto VI sizes nothing from this figure
+    // published here); the title sizes nothing from this figure
     // (it goes by the device type), so update it if a title does.
     pub const fn title_memory(self) -> (usize, usize) {
         match self {
             Console::SeriesX => (10 * GIB, 7 * GIB / 2),
             Console::SeriesS => (0, 7_776 << 20),
-        }
-    }
-
-    /// Compute units of the GPU.
-    pub const fn compute_units(self) -> u32 {
-        match self {
-            Console::SeriesX => 52,
-            Console::SeriesS => 20,
         }
     }
 
@@ -46,6 +38,7 @@ static SERIES_S: AtomicBool = AtomicBool::new(false);
 
 /// Set before the title starts.
 pub fn set(console: Console) {
+    victory_formats::texture::set_series_s_tiling(console == Console::SeriesS);
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
 }
 

@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "adler2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +221,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hidapi"
+version = "2.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "pkg-config",
+ "windows-sys",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,15 +289,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "miniz_oxide"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
-dependencies = [
- "adler2",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -333,6 +331,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,6 +376,15 @@ name = "regex-syntax"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rustix"
@@ -654,7 +667,6 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-game",
- "victory-gpu",
  "victory-hle",
  "victory-loader",
  "victory-pe",
@@ -683,7 +695,7 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
- "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -692,7 +704,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "miniz_oxide",
  "tempfile",
  "tracing",
  "victory-formats",
@@ -700,14 +711,16 @@ dependencies = [
  "victory-shader",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide",
+ "hidapi",
  "opus-pure",
+ "roxmltree",
  "tempfile",
  "tracing",
  "victory-formats",
@@ -717,6 +730,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -756,10 +770,10 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "miniz_oxide",
  "thiserror",
  "windows",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -914,3 +928,9 @@ dependencies = [
  "clap",
  "walkdir",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"

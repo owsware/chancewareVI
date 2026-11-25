@@ -183,8 +183,13 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::publish::write_if_changed(path, bytes)
-        .with_context(|| format!("publishing {}", path.display()))
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    Ok(())
 }
 
 impl LoadedImage {

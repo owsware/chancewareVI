@@ -37,7 +37,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x4cc2,
     [0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2],
 );
-/// As Grand Theft Auto VI (2026) asks for it; every slot it calls takes
+/// As the title (2026) asks for it; every slot it calls takes
 /// the public API's arguments in the same order as under the provider's
 /// own id (older titles).
 pub const IID_2026: Guid = Guid::new(
@@ -187,7 +187,7 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest or one of the blobs it names is missing.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -198,6 +198,14 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(info) if info.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
@@ -508,10 +516,15 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.highest + 1);
+        let Some(number) = current.as_ref().map_or(Some(1), |v| v.highest.checked_add(1)) else {
+            return NO_ACCESS;
+        };
+        tracing::info!(container = %self.name, version = number, written, "submitting local game save");
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
+            tracing::warn!(container = %self.name, version = number, error = %e, "local game save commit failed");
             return io_error(&self.dir, &e);
         }
+        tracing::info!(container = %self.name, version = number, "committed local game save");
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
             let _ = std::fs::remove_dir_all(&old.dir);
@@ -1446,12 +1459,17 @@ mod tests {
     #[test]
     fn an_unreadable_newer_version_does_not_cost_the_save() {
         type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
+        let strays: [(&str, Make); 4] = [
             ("empty folder", |p| std::fs::create_dir(p).unwrap()),
             ("file", |p| std::fs::write(p, b"not a version").unwrap()),
             ("broken manifest", |p| {
                 std::fs::create_dir(p).unwrap();
                 std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+            ("missing blob", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "two", &["a", "b"])).unwrap();
+                std::fs::write(p.join("0"), b"new a").unwrap();
             }),
         ];
         for (what, make) in strays {

@@ -17,17 +17,28 @@ env:
 
 jobs:
   check:
+    name: check
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      # Pinned by commit; the tag is beside it. actions/checkout v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Prepare verified BCPack format tables
+        shell: pwsh
+        run: ./Initialize-FormatTables.ps1
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # The runner has no graphics card. Tests that reach the software adapter report themselves ignored, with a
+      # printed reason, when VICTORY_TESTS_ALLOW_SOFTWARE_SKIP=1 (set here and nowhere else): a desk without the
+      # variable still fails loudly on WARP, and a real card still runs every test.
       - name: Tests
+        env:
+          VICTORY_TESTS_ALLOW_SOFTWARE_SKIP: "1"
         run: cargo test --workspace --locked

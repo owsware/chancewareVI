@@ -26,7 +26,7 @@ pub const IID: Guid = Guid::new(
     [0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d],
 );
 
-/// As Grand Theft Auto VI (2026) asks for it; it calls 0x20 (path) and 0x28
+/// As the title (2026) asks for it; it calls 0x20 (path) and 0x28
 /// (space) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x41a4_e10c,
@@ -42,11 +42,10 @@ const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 type This = *const Object;
 
-/// The path titles get: the root of a virtual drive over the folder. On the
-/// console storage is a drive of its own, and titles rely on it: Minecraft
-/// keeps only what precedes the path's last `:\` and mounts that as a
-/// drive, so a host folder such as `C:\Users\..` would make it write to the
-/// root of `C:`. None (the path calls fail) before the title is set.
+/// The title sees the root of a virtual drive over the storage folder.
+/// A title can mount just the drive portion of this path, so returning a
+/// host path would expose that drive's root instead of the storage folder.
+/// Returns `None` before the title is set.
 fn folder() -> Option<String> {
     let storage = runtime::title().storage;
     if storage.as_os_str().is_empty() {
