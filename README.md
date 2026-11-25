@@ -1,4 +1,6 @@
-# chancewareVI
+<h1 align="center">
+  <img src="https://raw.githubusercontent.com/owsware/chancewareVI/readme-artwork/chancewarevi.png" alt="chancewareVI" width="880">
+</h1>
 
 [![GitHub stars](https://img.shields.io/github/stars/owsware/chancewareVI?style=social)](https://github.com/owsware/chancewareVI/stargazers)
 [![GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
